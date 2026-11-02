@@ -193,6 +193,12 @@ struct smb2_context {
         uintptr_t iocp_key;
         struct smb2_iocp_sock *iocp_socks;
 #endif
+#ifdef HAVE_SSPI
+        /* smb2_set_sspi_cred(): a copy of the caller's CredHandle (not
+         * owned), see sspi-wrapper.c */
+        uintptr_t sspi_cred[2];
+        int sspi_cred_set;
+#endif
 
         enum smb2_sec sec;
 

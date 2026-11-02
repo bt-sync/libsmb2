@@ -580,6 +580,24 @@ void *smb2_get_opaque(struct smb2_context *smb2);
 int smb2_delegate_credentials(struct smb2_context *in, struct smb2_context *out);
 
 /*
+ * Windows, built with SSPI: authenticate with cred, a CredHandle * from
+ * AcquireCredentialsHandle() for the Negotiate or Kerberos package, for
+ * instance one for the logon session of an S4U logon (LsaLogonUser() with
+ * KERB_S4U_LOGON). It selects SMB2_SEC_KRB5 if no mechanism was set.
+ *
+ * The handle is copied, not owned: it must stay valid until the connect
+ * callback has been called, and the caller frees it. One handle can serve
+ * any number of contexts.
+ *
+ * Without it, SMB2_SEC_KRB5 on windows (the default when the server offers
+ * Kerberos) uses the user, domain and password if a password is set, else
+ * the credentials of the logon session of the calling thread.
+ *
+ * Returns 0, or -1 if built without SSPI support.
+ */
+int smb2_set_sspi_cred(struct smb2_context *smb2, const void *cred);
+
+/*
  * Sets the client_guid for this context.
  */
 void smb2_set_client_guid(struct smb2_context *smb2, const uint8_t guid[SMB2_GUID_SIZE]);

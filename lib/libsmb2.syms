@@ -169,6 +169,7 @@ smb2_set_pdu_status
 smb2_set_seal
 smb2_set_security_mode
 smb2_set_sign
+smb2_set_sspi_cred
 smb2_set_timeout
 smb2_set_tree_id_for_pdu
 smb2_get_user

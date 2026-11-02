@@ -14,13 +14,23 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
  * Print a file to stdout, with libsmb2 driven by an I/O completion port
  * (Windows), see smb2_iocp_attach().
  *
- *   smb2-cat-iocp smb://[domain;][user@]server[:port]/share/path
+ *   smb2-cat-iocp [-s user@REALM] smb://[domain;][user@]server[:port]/share/path
  *
  * The password comes from the file named by NTLM_USER_FILE, as with the
- * other examples; without one the session is anonymous.
+ * other examples. Without one, a server offering Kerberos is logged on to
+ * with the credentials of the current logon (SSPI), else anonymously.
+ *
+ * -s logs on as user@REALM by S4U: the impersonated user's credentials
+ * come from LsaLogonUser() with KERB_S4U_LOGON, and Windows does
+ * S4U2Self, and S4U2Proxy when connecting. That needs SeTcbPrivilege, so
+ * run it as SYSTEM (e.g. psexec -s) on a domain member whose computer
+ * account may delegate to cifs/<server>.
  */
 #include <winsock2.h>
 #include <windows.h>
+#define SECURITY_WIN32
+#include <security.h>
+#include <ntsecapi.h>
 
 #include <fcntl.h>
 #include <io.h>
@@ -48,6 +58,90 @@ struct cat {
         int failed;
         LARGE_INTEGER freq, last;
 };
+
+/*
+ * An SSPI credential for upn, by S4U. *token keeps the logon session
+ * alive; close it, and free *cred, once the session is set up.
+ */
+static int
+s4u_credential(const char *upn, CredHandle *cred, HANDLE *token)
+{
+        static char process_name[] = "smb2-cat-iocp";
+        static char kerberos[] = MICROSOFT_KERBEROS_NAME_A;
+        LSA_STRING name, package, origin;
+        LSA_OPERATIONAL_MODE mode;
+        KERB_S4U_LOGON *s4u;
+        TOKEN_SOURCE source;
+        QUOTA_LIMITS quotas;
+        void *profile = NULL;
+        ULONG profile_len, pkg, size;
+        NTSTATUS status, substatus;
+        SECURITY_STATUS sec;
+        TimeStamp expiry;
+        HANDLE lsa;
+        LUID luid;
+        int len;
+
+        name.Buffer = process_name;
+        name.Length = name.MaximumLength = (USHORT)strlen(process_name);
+        package.Buffer = kerberos;
+        package.Length = package.MaximumLength = (USHORT)strlen(kerberos);
+        origin = name;
+
+        /* a trusted connection: from an untrusted one, the token would
+         * only be good for identification */
+        status = LsaRegisterLogonProcess(&name, &lsa, &mode);
+        if (status != 0) {
+                fprintf(stderr, "LsaRegisterLogonProcess failed: %lu (run "
+                        "as SYSTEM)\n", LsaNtStatusToWinError(status));
+                return -1;
+        }
+        status = LsaLookupAuthenticationPackage(lsa, &package, &pkg);
+        if (status != 0) {
+                fprintf(stderr, "LsaLookupAuthenticationPackage failed: "
+                        "%lu\n", LsaNtStatusToWinError(status));
+                LsaDeregisterLogonProcess(lsa);
+                return -1;
+        }
+
+        len = MultiByteToWideChar(CP_UTF8, 0, upn, -1, NULL, 0) - 1;
+        size = (ULONG)(sizeof(*s4u) + (size_t)len * sizeof(WCHAR));
+        s4u = calloc(1, size);
+        s4u->MessageType = KerbS4ULogon;
+        s4u->ClientUpn.Buffer = (PWSTR)(s4u + 1);
+        s4u->ClientUpn.Length = s4u->ClientUpn.MaximumLength =
+                (USHORT)(len * sizeof(WCHAR));
+        MultiByteToWideChar(CP_UTF8, 0, upn, -1, s4u->ClientUpn.Buffer, len);
+
+        memset(&source, 0, sizeof(source));
+        memcpy(source.SourceName, "smb2cat", 7);
+        AllocateLocallyUniqueId(&source.SourceIdentifier);
+
+        status = LsaLogonUser(lsa, &origin, Network, pkg, s4u, size, NULL,
+                              &source, &profile, &profile_len, &luid, token,
+                              &quotas, &substatus);
+        free(s4u);
+        LsaDeregisterLogonProcess(lsa);
+        if (status != 0) {
+                fprintf(stderr, "S4U logon of %s failed: %lu (substatus "
+                        "0x%08lx)\n", upn, LsaNtStatusToWinError(status),
+                        (unsigned long)substatus);
+                return -1;
+        }
+        LsaFreeReturnBuffer(profile);
+
+        /* credentials of that logon session, without impersonating */
+        sec = AcquireCredentialsHandleW(NULL, L"Negotiate",
+                                        SECPKG_CRED_OUTBOUND, &luid, NULL,
+                                        NULL, NULL, cred, &expiry);
+        if (sec != SEC_E_OK) {
+                fprintf(stderr, "AcquireCredentialsHandle for the S4U "
+                        "logon failed: 0x%08lx\n", (unsigned long)sec);
+                CloseHandle(*token);
+                return -1;
+        }
+        return 0;
+}
 
 /* milliseconds since the previous mark */
 static double
@@ -163,13 +257,21 @@ int
 main(int argc, char *argv[])
 {
         static struct cat c;
+        const char *s4u_user = NULL, *url;
+        CredHandle s4u_cred;
+        HANDLE s4u_token = NULL;
         WSADATA wsa;
         HANDLE port;
         int released = 0;
 
-        if (argc < 2) {
-                fprintf(stderr, "usage: %s smb://[domain;][user@]server"
-                        "[:port]/share/path\n", argv[0]);
+        if (argc == 4 && strcmp(argv[1], "-s") == 0) {
+                s4u_user = argv[2];
+                url = argv[3];
+        } else if (argc == 2) {
+                url = argv[1];
+        } else {
+                fprintf(stderr, "usage: %s [-s user@REALM] smb://[domain;]"
+                        "[user@]server[:port]/share/path\n", argv[0]);
                 return 1;
         }
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -191,7 +293,7 @@ main(int argc, char *argv[])
                 fprintf(stderr, "smb2_init_context failed\n");
                 return 1;
         }
-        c.url = smb2_parse_url(c.smb2, argv[1]);
+        c.url = smb2_parse_url(c.smb2, url);
         if (c.url == NULL || c.url->path == NULL) {
                 fprintf(stderr, "bad URL: %s\n", smb2_get_error(c.smb2));
                 return 1;
@@ -208,6 +310,20 @@ main(int argc, char *argv[])
         }
 
         QueryPerformanceCounter(&c.last);
+        if (s4u_user) {
+                /* S4U2Self happens here, synchronously: a real event loop
+                 * would get the credential on another thread */
+                if (s4u_credential(s4u_user, &s4u_cred, &s4u_token) < 0) {
+                        return 1;
+                }
+                fprintf(stderr, "S4U logon of %s: %.2f ms\n", s4u_user,
+                        lap(&c));
+                if (smb2_set_sspi_cred(c.smb2, &s4u_cred) < 0) {
+                        fprintf(stderr, "smb2_set_sspi_cred: %s\n",
+                                smb2_get_error(c.smb2));
+                        return 1;
+                }
+        }
         if (smb2_connect_share_async(c.smb2, c.url->server, c.url->share,
                                      c.url->user, connect_cb, &c) != 0) {
                 fprintf(stderr, "smb2_connect_share_async: %s\n",
@@ -248,6 +364,11 @@ main(int argc, char *argv[])
 
         smb2_destroy_url(c.url);
         smb2_destroy_context(c.smb2);
+        if (s4u_token) {
+                /* only needed until the session was set up */
+                FreeCredentialsHandle(&s4u_cred);
+                CloseHandle(s4u_token);
+        }
 
         /* Operations still in flight when the socket closed complete now,
          * aborted. Hand them over so their memory is released. */

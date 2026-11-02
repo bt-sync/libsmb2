@@ -71,6 +71,8 @@ libsmb2_la_SOURCES = \
 	smb2-signing.c \
 	socket.c \
 	spnego-wrapper.c \
+	sspi-wrapper.h \
+	sspi-wrapper.c \
 	sync.c \
 	timestamps.c \
 	unicode.c \

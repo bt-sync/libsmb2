@@ -109,6 +109,9 @@
 #ifdef HAVE_LIBKRB5
 #include "krb5-wrapper.h"
 #endif
+#ifdef HAVE_SSPI
+#include "sspi-wrapper.h"
+#endif
 #include "spnego-wrapper.h"
 
 #if defined(ESP_PLATFORM)
@@ -660,9 +663,13 @@ free_c_data(struct smb2_context *smb2, struct connect_data *c_data)
                 if (smb2->sec == SMB2_SEC_NTLMSSP) {
                         ntlmssp_destroy_context(c_data->auth_data);
                 }
-#ifdef HAVE_LIBKRB5
+#if defined(HAVE_LIBKRB5)
                 else {
                         krb5_free_auth_data(c_data->auth_data);
+                }
+#elif defined(HAVE_SSPI)
+                else {
+                        sspi_free_auth_data(c_data->auth_data);
                 }
 #endif
         }
@@ -901,6 +908,13 @@ session_setup_cb(struct smb2_context *smb2, int status,
                                          rep->security_buffer,
                                          rep->security_buffer_length);
        }
+#elif defined(HAVE_SSPI)
+        if (smb2->sec == SMB2_SEC_KRB5 && rep->security_buffer) {
+                /* the server's mutual authentication token, as above */
+                sspi_session_request(smb2, c_data->auth_data,
+                                     rep->security_buffer,
+                                     rep->security_buffer_length);
+        }
 #endif
 
 
@@ -915,9 +929,15 @@ session_setup_cb(struct smb2_context *smb2, int status,
                                 have_valid_session_key = 0;
                         }
                 }
-#ifdef HAVE_LIBKRB5
+#if defined(HAVE_LIBKRB5)
                 else {
                         if (krb5_session_get_session_key(smb2, c_data->auth_data) < 0) {
+                                have_valid_session_key = 0;
+                        }
+                }
+#elif defined(HAVE_SSPI)
+                else {
+                        if (sspi_session_get_session_key(smb2, c_data->auth_data) < 0) {
                                 have_valid_session_key = 0;
                         }
                 }
@@ -1038,6 +1058,18 @@ send_session_setup_request(struct smb2_context *smb2,
                 req.security_buffer =
                         krb5_get_output_token_buffer(c_data->auth_data);
         }
+#elif defined(HAVE_SSPI)
+        else {
+                if (sspi_session_request(smb2, c_data->auth_data,
+                                         buf, len) < 0) {
+                        smb2_close_context(smb2);
+                        return -1;
+                }
+                req.security_buffer_length =
+                        sspi_get_output_token_length(c_data->auth_data);
+                req.security_buffer =
+                        sspi_get_output_token_buffer(c_data->auth_data);
+        }
 #endif
 
         pdu = smb2_cmd_session_setup_async(smb2, &req,
@@ -1152,7 +1184,7 @@ negotiate_cb(struct smb2_context *smb2, int status,
                 smb2_spnego_unwrap_gssapi(smb2, rep->security_buffer,
                         rep->security_buffer_length, 1,
                         NULL, &spnego_mechs);
-#ifdef HAVE_LIBKRB5
+#if defined(HAVE_LIBKRB5) || defined(HAVE_SSPI)
                 if (spnego_mechs & SPNEGO_MECHANISM_KRB5) {
                         smb2->sec = SMB2_SEC_KRB5;
                 }
@@ -1163,7 +1195,7 @@ negotiate_cb(struct smb2_context *smb2, int status,
                 }
         }
         if (smb2->sec == SMB2_SEC_UNDEFINED) {
-#ifdef HAVE_LIBKRB5
+#if defined(HAVE_LIBKRB5) || defined(HAVE_SSPI)
                 smb2->sec = SMB2_SEC_KRB5;
 #else
                 smb2->sec = SMB2_SEC_NTLMSSP;
@@ -1191,6 +1223,27 @@ negotiate_cb(struct smb2_context *smb2, int status,
                  * after negotiate and never sends SessionSetup.
                  */
                 if (c_data->auth_data == NULL &&
+                    (spnego_mechs & SPNEGO_MECHANISM_NTLMSSP)) {
+                        smb2_set_error(smb2, "");
+                        smb2->sec = SMB2_SEC_NTLMSSP;
+                        c_data->auth_data = ntlmssp_init_context(
+                                                         smb2->user,
+                                                         smb2->password,
+                                                         smb2->domain,
+                                                         smb2->workstation,
+                                                         smb2->client_challenge);
+                }
+        }
+#elif defined(HAVE_SSPI)
+        else {
+                c_data->auth_data = sspi_negotiate_reply(smb2,
+                                                         c_data->server,
+                                                         smb2->domain,
+                                                         c_data->user,
+                                                         smb2->password);
+                /* as above, unless the caller handed us a credential,
+                 * which only SSPI can use */
+                if (c_data->auth_data == NULL && !smb2->sspi_cred_set &&
                     (spnego_mechs & SPNEGO_MECHANISM_NTLMSSP)) {
                         smb2_set_error(smb2, "");
                         smb2->sec = SMB2_SEC_NTLMSSP;
