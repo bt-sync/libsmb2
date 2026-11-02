@@ -184,6 +184,15 @@ struct smb2_context {
         int rdma;
         struct smb2_rdma *rdma_conn;
 #endif
+#ifdef HAVE_SMB2_IOCP
+        /* smb2_iocp_attach(): overlapped I/O through the caller's I/O
+         * completion port instead of readiness polling, see smbiocp.c.
+         * iocp_socks are the sockets being connected, and the connected
+         * one (smb2->fd). */
+        void *iocp_port;
+        uintptr_t iocp_key;
+        struct smb2_iocp_sock *iocp_socks;
+#endif
 
         enum smb2_sec sec;
 
@@ -487,6 +496,40 @@ void smb2_rdma_cap_io_sizes(struct smb2_context *smb2);
 void smb2_rdma_reset(struct smb2_context *smb2);
 #else
 #define smb2_rdma_reset(smb2) do { } while (0)
+#endif
+
+#ifdef HAVE_SMB2_IOCP
+struct iovec;
+struct addrinfo;
+/* smb2_iocp_service() results besides 0 and -1 */
+#define SMB2_IOCP_CONNECTED      1
+#define SMB2_IOCP_CONNECT_FAILED 2
+/* Addresses connected to in parallel: smb2_connect_async() interleaves
+ * the address families, so normally one IPv6 and one IPv4 address. Unlike
+ * the Happy Eyeballs of the poll interface this needs no caller-driven
+ * timer, and a refused connect takes seconds on windows. */
+#define SMB2_IOCP_PARALLEL_CONNECTS 2
+int smb2_iocp_connect(struct smb2_context *smb2, const struct addrinfo *ai,
+                      t_socket *fd_out);
+int smb2_iocp_service(struct smb2_context *smb2, t_socket *fd, int *err);
+int smb2_iocp_flush(struct smb2_context *smb2);
+ssize_t smb2_iocp_writev(struct smb2_context *smb2,
+                         const struct iovec *iov, int iovcnt);
+ssize_t smb2_iocp_readv(struct smb2_context *smb2,
+                        const struct iovec *iov, int iovcnt);
+void smb2_iocp_close(struct smb2_context *smb2, t_socket fd);
+/* Close a socket of the context: an IOCP socket must not be closed
+ * directly, its overlapped operations still in flight outlive it. */
+#define smb2_close_socket(smb2, fd)                                     \
+        do {                                                            \
+                if ((smb2)->iocp_port != NULL) {                        \
+                        smb2_iocp_close((smb2), (fd));                  \
+                } else {                                                \
+                        close(fd);                                      \
+                }                                                       \
+        } while (0)
+#else
+#define smb2_close_socket(smb2, fd) close(fd)
 #endif
 
 void *smb2_alloc_init(struct smb2_context *smb2, size_t size);

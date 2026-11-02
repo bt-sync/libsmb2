@@ -34,6 +34,7 @@ libsmb2_la_SOURCES = \
 	pdu.c \
 	quic.c \
 	smbdirect.c \
+	smbiocp.c \
 	sha.h \
 	sha-private.h \
 	sha1.c \

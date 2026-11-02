@@ -110,6 +110,8 @@ smb2_get_uint32
 smb2_get_user
 smb2_get_workstation
 smb2_init_context
+smb2_iocp_attach
+smb2_iocp_complete
 smb2_link
 smb2_link_async
 smb2_lseek

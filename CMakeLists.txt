@@ -231,6 +231,14 @@ endif()
     if(CMAKE_SYSTEM_NAME MATCHES Windows)
       list(APPEND CORE_LIBRARIES ws2_32.lib)
       add_definitions(-DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -DHAVE_LINGER -DNEED_GETLOGIN_R -DNEED_GETPID -DNEED_RANDOM -DNEED_SRANDOM)
+      # Overlapped I/O on the caller's I/O completion port, see
+      # smb2_iocp_attach(). config.h is not used here, so define it for
+      # every source: it changes the layout of struct smb2_context.
+      option(ENABLE_IOCP "Enable the I/O completion port transport" ON)
+      if(ENABLE_IOCP)
+        message(STATUS "Build with I/O completion port support")
+        add_definitions(-DHAVE_SMB2_IOCP)
+      endif()
     elseif(CMAKE_SYSTEM_NAME MATCHES NintendoSwitch)
       add_definitions(-DNEED_READV -DNEED_WRITEV -DNEED_GETLOGIN_R)
     elseif(CMAKE_SYSTEM_NAME MATCHES Nintendo3DS)

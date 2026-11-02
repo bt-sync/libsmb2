@@ -149,7 +149,7 @@ smb2_close_connecting_fds(struct smb2_context *smb2)
                 if (smb2->change_fd) {
                         smb2->change_fd(smb2, fd, SMB2_DEL_FD);
                 }
-                close(fd);
+                smb2_close_socket(smb2, fd);
         }
         free(smb2->connecting_fds);
         smb2->connecting_fds = NULL;
@@ -317,6 +317,11 @@ smb2_write_to_socket(struct smb2_context *smb2)
 #ifdef HAVE_LIBRDMACM
                 if (smb2->rdma) {
                         count = smb2_rdma_writev(smb2, tmpiov, niov);
+                } else
+#endif
+#ifdef HAVE_SMB2_IOCP
+                if (smb2->iocp_port != NULL) {
+                        count = smb2_iocp_writev(smb2, tmpiov, niov);
                 } else
 #endif
                 count = writev(smb2->fd, tmpiov, niov);
@@ -1160,6 +1165,11 @@ static ssize_t smb2_readv_from_socket(struct smb2_context *smb2,
                 return smb2_rdma_readv(smb2, iov, iovcnt);
         }
 #endif
+#ifdef HAVE_SMB2_IOCP
+        if (smb2->iocp_port != NULL) {
+                return smb2_iocp_readv(smb2, iov, iovcnt);
+        }
+#endif
         rc = readv(smb2->fd, (struct iovec*) iov, iovcnt);
         return rc;
 }
@@ -1233,7 +1243,7 @@ smb2_close_connecting_fd(struct smb2_context *smb2, t_socket fd)
 {
         size_t i;
 
-        close(fd);
+        smb2_close_socket(smb2, fd);
         /* Remove the fd from the connecting_fds array */
         for (i = 0; i < smb2->connecting_fds_count; ++i) {
                 if (fd == smb2->connecting_fds[i]) {
@@ -1251,6 +1261,70 @@ int
 smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
 {
         int ret = 0;
+
+#ifdef HAVE_SMB2_IOCP
+        /* Called after every completion (and as a timer, for timeouts):
+         * there are no readiness events, so fd and revents do not matter. */
+        if (smb2->iocp_port != NULL) {
+                t_socket cfd = SMB2_INVALID_SOCKET;
+                int err = 0;
+
+                ret = smb2_iocp_service(smb2, &cfd, &err);
+                if (ret == SMB2_IOCP_CONNECT_FAILED) {
+                        smb2_close_connecting_fd(smb2, cfd);
+                        if (smb2->next_addrinfo != NULL) {
+                                smb2_connect_async_next_addr(smb2, smb2->next_addrinfo);
+                        }
+                        if (smb2->connecting_fds_count > 0) {
+                                /* other addresses are still being tried */
+                                ret = 0;
+                                goto out;
+                        }
+                        ret = -1;
+                        smb2_set_error(smb2, "smb2_service: socket error "
+                                        "%s(%d) while connecting.",
+                                        strerror(err), err);
+                        if (smb2->connect_cb) {
+                                smb2->connect_cb(smb2, err, NULL, smb2->connect_data);
+                                smb2->connect_cb = NULL;
+                        }
+                        goto out;
+                }
+                if (ret == SMB2_IOCP_CONNECTED) {
+                        ret = 0;
+                        smb2->fd = cfd;
+                        smb2_close_connecting_fds(smb2);
+                        if (smb2->connect_cb) {
+                                smb2->connect_cb(smb2, 0, NULL, smb2->connect_data);
+                                smb2->connect_cb = NULL;
+                        }
+                }
+                if (ret < 0 || !SMB2_VALID_SOCKET(smb2->fd)) {
+                        goto out;
+                }
+                if (smb2_read_from_socket(smb2) != 0) {
+                        /* A callback closing the connection (disconnect,
+                         * or a failed connect, both already reported to
+                         * the caller through their callbacks) is not a
+                         * failure of this call. A read error leaves the
+                         * socket open. */
+                        ret = SMB2_VALID_SOCKET(smb2->fd) ? -1 : 0;
+                        goto out;
+                }
+                if (!SMB2_VALID_SOCKET(smb2->fd)) {
+                        goto out;
+                }
+                if (smb2->outqueue != NULL &&
+                    smb2_write_to_socket(smb2) != 0) {
+                        ret = -1;
+                        goto out;
+                }
+                if (smb2_iocp_flush(smb2) < 0) {
+                        ret = -1;
+                }
+                goto out;
+        }
+#endif
 
         if (!SMB2_VALID_SOCKET(fd)) {
                 /* Connect to a new addr in parallel */
@@ -1638,6 +1712,25 @@ smb2_connect_async_next_addr(struct smb2_context *smb2, const struct addrinfo *b
                                 smb2_set_error(smb2, "");
                                 smb2_close_connecting_fds(smb2);
                                 return 0;
+                        }
+                        continue;
+                }
+#endif
+#ifdef HAVE_SMB2_IOCP
+                if (smb2->iocp_port != NULL) {
+                        t_socket s;
+
+                        /* A few addresses in parallel, the first to
+                         * connect wins. The rest are tried as these
+                         * fail, see smb2_service_fd(). */
+                        if (smb2->connecting_fds_count >= SMB2_IOCP_PARALLEL_CONNECTS) {
+                                break;
+                        }
+                        smb2->next_addrinfo = ai->ai_next;
+                        if (smb2_iocp_connect(smb2, ai, &s) == 0) {
+                                smb2_set_error(smb2, "");
+                                smb2->connecting_fds[smb2->connecting_fds_count++] = s;
+                                err = 0;
                         }
                         continue;
                 }

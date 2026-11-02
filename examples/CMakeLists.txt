@@ -21,6 +21,12 @@ set(SOURCES smb2-cat-async
             smb2-compound
             smb2-link-sync)
 
+# The examples above need a POSIX host (poll.h and friends). On Windows,
+# build the ones written for it instead.
+if(WIN32)
+  set(SOURCES smb2-cat-iocp)
+endif()
+
 set(DCERPC_SOURCES smb2-share-enum
             dcerpc
             smb2-lsa-lookupsids

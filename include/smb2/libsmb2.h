@@ -300,6 +300,52 @@ int smb2_service(struct smb2_context *smb2, int revents);
 int smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents);
 
 /*
+ * I/O COMPLETION PORTS (Windows)
+ * ==============================
+ * Instead of being polled for readiness, the context can run its socket
+ * with overlapped I/O on an I/O completion port of the caller. libsmb2
+ * then never needs to be told that a socket is readable or writable, the
+ * caller only hands it the completions.
+ *
+ * smb2_iocp_attach() must be called before smb2_connect_async() or
+ * smb2_connect_share_async(). Every socket of the context is associated
+ * with iocp (a HANDLE) using key as the completion key; the caller uses
+ * the key to recognise libsmb2's completions among its own.
+ * Do not use smb2_get_fd(), smb2_which_events() or
+ * smb2_fd_event_callbacks() with an attached context.
+ *
+ * Returns 0, or -1 if the context is already connecting or connected, or
+ * if libsmb2 was built without IOCP support.
+ */
+int smb2_iocp_attach(struct smb2_context *smb2, void *iocp, uintptr_t key);
+
+/*
+ * Hand libsmb2 a completion dequeued from the port with its key:
+ * the OVERLAPPED pointer, the number of bytes transferred, and the error
+ * (0 on success, else the GetLastError() value of a failed dequeue).
+ *
+ * *smb2 is set to the context the completion belongs to, or to NULL if
+ * that context has already been destroyed: operations still in flight
+ * when a socket is closed complete afterwards, and are only released.
+ * Keep dequeuing and handing over completions for a while after
+ * destroying a context, or memory is leaked.
+ *
+ * All calls for one context, including this one with its completions,
+ * must not run concurrently. Completions with *smb2 set to NULL may be
+ * handed over from any thread.
+ *
+ * Call smb2_service() periodically as well if smb2_set_timeout() is used,
+ * it is what expires the timed out commands.
+ *
+ * Returns:
+ *  0 : Success
+ * <0 : Unrecoverable failure of *smb2. At this point the context can no
+ *      longer be used and must be freed by calling smb2_destroy_context().
+ */
+int smb2_iocp_complete(void *overlapped, unsigned long bytes,
+                       unsigned long error, struct smb2_context **smb2);
+
+/*
  * Set the timeout in seconds after which a command will be aborted with
  * SMB2_STATUS_IO_TIMEOUT.
  * If you use timeouts with the async API you must make sure to call
