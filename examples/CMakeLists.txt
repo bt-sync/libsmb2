@@ -24,7 +24,7 @@ set(SOURCES smb2-cat-async
 # The examples above need a POSIX host (poll.h and friends). On Windows,
 # build the ones written for it instead.
 if(WIN32)
-  set(SOURCES smb2-cat-iocp)
+  set(SOURCES smb2-cat-iocp smb2-close-disconnected)
 endif()
 
 set(DCERPC_SOURCES smb2-share-enum
