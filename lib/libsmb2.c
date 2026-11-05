@@ -141,6 +141,9 @@ const smb2_file_id compound_file_id = {
         0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff
 };
 
+/* NTLMSSP takes 2 or 3, Kerberos 1 or 2 */
+#define SMB2_MAX_SESSION_SETUP_LEGS 16
+
 struct connect_data {
         smb2_command_cb cb;
         void *cb_data;
@@ -157,6 +160,15 @@ struct connect_data {
 
         /* if context is being served by our server */
         struct smb2_server *server_context;
+
+        /* Server: the initiator's SPNEGO MechTypeList, and the
+         * negTokenResp choosing NTLMSSP over its preferred mech. */
+        uint8_t *mech_types;
+        int mech_types_len;
+        int ntlm_counter_proposed;
+        void *select_ntlmssp;
+        /* Server: SESSION_SETUP requests in the session setup going on */
+        int session_setup_legs;
 };
 
 struct smb2fh {
@@ -682,6 +694,8 @@ free_c_data(struct smb2_context *smb2, struct connect_data *c_data)
         free(discard_const(c_data->server));
         free(discard_const(c_data->share));
         free(discard_const(c_data->user));
+        free(c_data->mech_types);
+        free(c_data->select_ntlmssp);
         free(c_data);
 }
 
@@ -705,6 +719,34 @@ tree_connect_cb(struct smb2_context *smb2, int status,
         free_c_data(smb2, c_data);
 }
 
+/* SP800-108 counter mode KDF with HMAC-SHA256. ki_len bytes of the
+ * derivation key are used, zero padded to at least 16, and out_len (16 or
+ * 32) bytes are derived. */
+static void smb2_kdf(const uint8_t *derivation_key, uint32_t derivation_key_len, uint32_t ki_len,
+                     const char *label, uint32_t label_len, const char *context, uint32_t context_len,
+                     uint8_t *derived_key, uint32_t out_len)
+{
+        unsigned char nul = 0;
+        const uint32_t counter = htobe32(1);
+        const uint32_t keylen = htobe32(out_len * 8);
+        uint8_t input_key[SMB2_ENC_KEY_SIZE_MAX] = {0};
+        HMACContext ctx;
+        uint8_t digest[USHAMaxHashSize];
+
+        if (ki_len < SMB2_KEY_SIZE) {
+                ki_len = SMB2_KEY_SIZE;
+        }
+        memcpy(input_key, derivation_key, MIN(ki_len, derivation_key_len));
+        hmacReset(&ctx, SHA256, input_key, ki_len);
+        hmacInput(&ctx, (unsigned char *)&counter, sizeof(counter));
+        hmacInput(&ctx, (unsigned char *)label, label_len);
+        hmacInput(&ctx, &nul, 1);
+        hmacInput(&ctx, (unsigned char *)context, context_len);
+        hmacInput(&ctx, (unsigned char *)&keylen, sizeof(keylen));
+        hmacResult(&ctx, digest);
+        memcpy(derived_key, digest, out_len);
+}
+
 void smb2_derive_key(
     uint8_t     *derivation_key,
     uint32_t    derivation_key_len,
@@ -715,23 +757,8 @@ void smb2_derive_key(
     uint8_t     derived_key[SMB2_KEY_SIZE]
     )
 {
-        unsigned char nul = 0;
-        const uint32_t counter = htobe32(1);
-        const uint32_t keylen = htobe32(SMB2_KEY_SIZE * 8);
-        uint8_t input_key[SMB2_KEY_SIZE] = {0};
-        HMACContext ctx;
-        uint8_t digest[USHAMaxHashSize];
-
-        memcpy(input_key, derivation_key, MIN(sizeof(input_key),
-                                              derivation_key_len));
-        hmacReset(&ctx, SHA256, input_key, sizeof(input_key));
-        hmacInput(&ctx, (unsigned char *)&counter, sizeof(counter));
-        hmacInput(&ctx, (unsigned char *)label, label_len);
-        hmacInput(&ctx, &nul, 1);
-        hmacInput(&ctx, (unsigned char *)context, context_len);
-        hmacInput(&ctx, (unsigned char *)&keylen, sizeof(keylen));
-        hmacResult(&ctx, digest);
-        memcpy(derived_key, digest, SMB2_KEY_SIZE);
+        smb2_kdf(derivation_key, derivation_key_len, SMB2_KEY_SIZE, label, label_len,
+                 context, context_len, derived_key, SMB2_KEY_SIZE);
 }
 
 /* MS-SMB2 3.2.5.2 */
@@ -815,6 +842,13 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 sizeof(ServerOut),
                                 smb2->serverout_key);
         } else if (smb2->dialect > SMB2_VERSION_0302) {
+                /* MS-SMB2 3.2.5.3.1: AES-256 keys come from the full session key */
+                uint32_t ki_len = SMB2_KEY_SIZE, out_len = SMB2_KEY_SIZE;
+
+                if (smb2->cypher == SMB2_ENCRYPTION_AES_256_GCM) {
+                        ki_len = MIN(smb2->session_key_size, SMB2_ENC_KEY_SIZE_MAX);
+                        out_len = SMB2_ENC_KEY_SIZE_MAX;
+                }
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMBSigningKey,
@@ -829,20 +863,14 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
                                 smb2->application_key);
-                smb2_derive_key(smb2->session_key,
-                                smb2->session_key_size,
-                                SMBC2SCipherKey,
-                                sizeof(SMBC2SCipherKey),
-                                (char *)smb2->preauthhash,
-                                SMB2_PREAUTH_HASH_SIZE,
-                                smb2->serverin_key);
-                smb2_derive_key(smb2->session_key,
-                                smb2->session_key_size,
-                                SMBS2CCipherKey,
-                                sizeof(SMBS2CCipherKey),
-                                (char *)smb2->preauthhash,
-                                SMB2_PREAUTH_HASH_SIZE,
-                                smb2->serverout_key);
+                smb2_kdf(smb2->session_key, smb2->session_key_size, ki_len,
+                         SMBC2SCipherKey, sizeof(SMBC2SCipherKey),
+                         (char *)smb2->preauthhash, SMB2_PREAUTH_HASH_SIZE,
+                         smb2->serverin_key, out_len);
+                smb2_kdf(smb2->session_key, smb2->session_key_size, ki_len,
+                         SMBS2CCipherKey, sizeof(SMBS2CCipherKey),
+                         (char *)smb2->preauthhash, SMB2_PREAUTH_HASH_SIZE,
+                         smb2->serverout_key, out_len);
         }
 }
 
@@ -894,7 +922,8 @@ session_setup_cb(struct smb2_context *smb2, int status,
         }
 
 #ifdef HAVE_LIBKRB5
-       if (smb2->sec == SMB2_SEC_KRB5) {
+       if (smb2->sec == SMB2_SEC_KRB5 ||
+           smb2->sec == SMB2_SEC_IAKERB) {
                 /* For NTLM the status will be
                  * SMB2_STATUS_MORE_PROCESSING_REQUIRED and a second call to
                  * gss_init_sec_context will complete the gss session.
@@ -904,9 +933,16 @@ session_setup_cb(struct smb2_context *smb2, int status,
                  * At this point SMB2 layer reported success already, so we
                  * ignore krb5 errors.
                  */
-                krb5_session_request(smb2, c_data->auth_data,
+                if (krb5_session_request(smb2, c_data->auth_data,
                                          rep->security_buffer,
-                                         rep->security_buffer_length);
+                                         rep->security_buffer_length) < 0 &&
+                    smb2->sec == SMB2_SEC_IAKERB) {
+                        /* the acceptor's SPNEGO mechListMIC did not verify */
+                        smb2_close_context(smb2);
+                        c_data->cb(smb2, -EACCES, NULL, c_data->cb_data);
+                        free_c_data(smb2, c_data);
+                        return;
+                }
        }
 #elif defined(HAVE_SSPI)
         if (smb2->sec == SMB2_SEC_KRB5 && rep->security_buffer) {
@@ -1223,6 +1259,7 @@ negotiate_cb(struct smb2_context *smb2, int status,
                  * after negotiate and never sends SessionSetup.
                  */
                 if (c_data->auth_data == NULL &&
+                    smb2->sec != SMB2_SEC_IAKERB &&
                     (spnego_mechs & SPNEGO_MECHANISM_NTLMSSP)) {
                         smb2_set_error(smb2, "");
                         smb2->sec = SMB2_SEC_NTLMSSP;
@@ -4995,13 +5032,18 @@ smb2_server_retire_session(struct smb2_server *server, struct smb2_context *smb2
 #endif
                 c_data->auth_data = NULL;
         }
+        free(c_data->mech_types);
+        c_data->mech_types = NULL;
+        c_data->mech_types_len = 0;
+        c_data->ntlm_counter_proposed = 0;
+        c_data->session_setup_legs = 0;
         free(smb2->session_key);
         smb2->session_key = NULL;
         smb2->session_key_size = 0;
         memset(smb2->signing_key, 0, SMB2_KEY_SIZE);
         memset(smb2->application_key, 0, SMB2_KEY_SIZE);
-        memset(smb2->serverin_key, 0, SMB2_KEY_SIZE);
-        memset(smb2->serverout_key, 0, SMB2_KEY_SIZE);
+        memset(smb2->serverin_key, 0, sizeof(smb2->serverin_key));
+        memset(smb2->serverout_key, 0, sizeof(smb2->serverout_key));
         smb2->enc_keys_ready = 0;
         smb2->session_id = 0;
         memcpy(smb2->preauthhash, smb2->negotiate_preauthhash, SMB2_PREAUTH_HASH_SIZE);
@@ -5173,6 +5215,15 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 return;
         }
 
+        /* Every leg can make the server work, NTLMSSP and Kerberos keep
+         * state that grows, so a client gets a bounded number of them. */
+        if (++c_data->session_setup_legs > SMB2_MAX_SESSION_SETUP_LEGS) {
+                smb2_set_error(smb2, "session setup needs more than %d legs",
+                               SMB2_MAX_SESSION_SETUP_LEGS);
+                smb2_close_context(smb2);
+                return;
+        }
+
         rep.security_buffer_length = 0;
         rep.security_buffer_offset = 0;
 
@@ -5182,6 +5233,61 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
         memset(&err, 0, sizeof(err));
 
         pdu = NULL;
+
+        if ((smb2->sec == SMB2_SEC_UNDEFINED || smb2->sec == SMB2_SEC_NTLMSSP) &&
+            c_data->mech_types == NULL) {
+                uint32_t first_mech, mechs;
+                const uint8_t *types;
+                int types_len, krb5_usable = 0;
+
+                if (smb2_spnego_parse_mech_types(smb2, req->security_buffer,
+                                                 req->security_buffer_length,
+                                                 &first_mech, &mechs,
+                                                 &types, &types_len) == 0) {
+                        c_data->mech_types = malloc(types_len);
+                        if (c_data->mech_types == NULL) {
+                                smb2_set_error(smb2, "Failed to allocate mechTypes");
+                                smb2_close_context(smb2);
+                                return;
+                        }
+                        memcpy(c_data->mech_types, types, types_len);
+                        c_data->mech_types_len = types_len;
+#ifdef HAVE_LIBKRB5
+                        krb5_usable = smb2->sec != SMB2_SEC_NTLMSSP;
+#endif
+                        /*
+                         * MIT's SPNEGO handles any list with krb5 in it.
+                         * Otherwise, if the preferred mech is one we lack,
+                         * choose NTLMSSP and wait for its NEGOTIATE.
+                         */
+                        if (first_mech != SPNEGO_MECHANISM_NTLMSSP &&
+                            (mechs & SPNEGO_MECHANISM_NTLMSSP) &&
+                            !(krb5_usable && (mechs & (SPNEGO_MECHANISM_KRB5 |
+                                                       SPNEGO_MECHANISM_IAKERB)))) {
+                                int len;
+
+                                free(c_data->select_ntlmssp);
+                                c_data->select_ntlmssp = NULL;
+                                len = smb2_spnego_select_ntlmssp(smb2, &c_data->select_ntlmssp);
+                                if (len < 0) {
+                                        smb2_close_context(smb2);
+                                        return;
+                                }
+                                smb2->sec = SMB2_SEC_NTLMSSP;
+                                c_data->ntlm_counter_proposed = 1;
+                                rep.security_buffer = c_data->select_ntlmssp;
+                                rep.security_buffer_length = len;
+                                if (!smb2->session_id) {
+                                        smb2->session_id = server->session_counter++;
+                                }
+                                smb2->connect_data = c_data;
+                                smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
+                                               smb2_session_setup_request_cb, cb_data);
+                                more_processing_needed = 1;
+                                goto reply;
+                        }
+                }
+        }
 
         if (smb2->sec == SMB2_SEC_UNDEFINED || smb2->sec == SMB2_SEC_NTLMSSP) {
                 /* if we haven't set sec type yet, and the blob contains
@@ -5223,7 +5329,11 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                                         server->hostname,
                                         smb2->client_challenge
                                         );
-                        if (!c_data->auth_data) {
+                        if (!c_data->auth_data ||
+                            ntlmssp_set_spnego_mech_types(c_data->auth_data,
+                                                          c_data->mech_types,
+                                                          c_data->mech_types_len,
+                                                          c_data->ntlm_counter_proposed) < 0) {
                                 smb2_set_error(smb2, "can not init auth data %s", smb2_get_error(smb2));
                                 smb2_close_context(smb2);
                                 return;
@@ -5234,7 +5344,9 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                         smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
                                        smb2_session_setup_request_cb, cb_data);
                         more_processing_needed = 1;
-                        smb2->session_id = server->session_counter++;
+                        if (!smb2->session_id) {
+                                smb2->session_id = server->session_counter++;
+                        }
                 }
                 else if (message_type == AUTHENTICATION_MESSAGE) {
                         if (c_data->auth_data == NULL) {
@@ -5309,7 +5421,6 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 if (more_processing_needed) {
                         smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
                                                 smb2_session_setup_request_cb, cb_data);
-                        smb2->session_id = server->session_counter++;
                 } else {
                         smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_TREE_CONNECT,
                                                 smb2_general_client_request_cb, cb_data);
@@ -5319,11 +5430,13 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 rep.security_buffer =
                         krb5_get_output_token_buffer(c_data->auth_data);
 
-                if (!krb5_session_get_session_key(smb2, c_data->auth_data)) {
+                if (!more_processing_needed &&
+                    !krb5_session_get_session_key(smb2, c_data->auth_data)) {
                         have_valid_session_key = 1;
                 }
         }
 #endif
+reply:
         if (smb2->sign && have_valid_session_key == 0) {
                 smb2_close_context(smb2);
                 smb2_set_error(smb2, "Signing required by server. Session "
@@ -5341,12 +5454,19 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
         if (!more_processing_needed && have_valid_session_key &&
             smb2->session_key_size) {
                 smb2_create_signing_key(smb2);
+                if (smb2->dialect >= SMB2_VERSION_0300) {
+                        smb2->enc_keys_ready = 1;
+                }
         }
 
-        if (server->allow_anonymous &&
-                         ((smb2->user == NULL || smb2->user[0] == '\0')||
-                         (smb2->password == NULL || smb2->password[0] == '\0'))) {
+        if (!more_processing_needed && server->allow_anonymous &&
+            smb2->sec == SMB2_SEC_NTLMSSP &&
+            (smb2->user == NULL || smb2->user[0] == '\0')) {
                 rep.session_flags |= SMB2_SESSION_FLAG_IS_GUEST;
+        }
+
+        if (!more_processing_needed) {
+                c_data->session_setup_legs = 0;
         }
 
         if (!pdu) {
@@ -5360,6 +5480,15 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                         pdu->header.status = SMB2_STATUS_MORE_PROCESSING_REQUIRED;
                 }
                 else {
+                        /* 3.1.1 always signs the final response of an
+                         * authenticated session, so the client can check
+                         * the preauth integrity hash (MS-SMB2 3.3.5.5.3) */
+                        if (smb2->dialect == SMB2_VERSION_0311 &&
+                            smb2->session_key_size &&
+                            !(rep.session_flags & (SMB2_SESSION_FLAG_IS_GUEST |
+                                                   SMB2_SESSION_FLAG_IS_NULL))) {
+                                pdu->must_sign = 1;
+                        }
                         if (server->handlers && server->handlers->session_established) {
                                 ret = server->handlers->session_established(server, smb2);
                                 if (ret) {
@@ -5566,6 +5695,10 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
         rep.max_read_size      = smb2->max_read_size;
         rep.max_write_size     = smb2->max_write_size;
         rep.dialect_revision   = smb2->dialect;
+        /* only 3.1.1 negotiates a cipher, 3.0 and 3.0.2 always use AES-128-CCM */
+        if (smb2->dialect != SMB2_VERSION_0311) {
+                smb2->cypher = 0;
+        }
         rep.cypher             = smb2->cypher;
 
         /* remember negotiated capabilites and security mode */
@@ -5688,7 +5821,24 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                 return err;
         }
 #endif
-        err = smb2_bind_and_listen(server->port, max_connections, &server->fd);
+        if (server->quic) {
+#ifdef HAVE_LIBQUIC
+                err = smb2_quic_listen(server->port, max_connections, &server->fd);
+                if (err != 0) {
+                        snprintf(server->error, sizeof(server->error),
+                                 "QUIC listen on port %u failed: %s, is the "
+                                 "quic kernel module loaded?",
+                                 server->port ? server->port : 443,
+                                 strerror(-err));
+                }
+#else
+                snprintf(server->error, sizeof(server->error),
+                         "built without libquic");
+                err = -EINVAL;
+#endif
+        } else {
+                err = smb2_bind_and_listen(server->port, max_connections, &server->fd);
+        }
         if (err != 0) {
                 return err;
         }
@@ -5801,6 +5951,14 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                                         if (cb) {
                                                 cb(smb2, cb_data);
                                         }
+#ifdef HAVE_LIBQUIC
+                                        if (server->quic &&
+                                            smb2_quic_server_handshake_start(smb2,
+                                                        server->quic_cert_file,
+                                                        server->quic_key_file) < 0) {
+                                                smb2_close_context(smb2);
+                                        }
+#endif
                                 }
                                 else if (err) {
                                         break;

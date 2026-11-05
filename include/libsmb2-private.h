@@ -55,6 +55,8 @@ extern "C" {
 
 #define SMB2_SIGNATURE_SIZE 16
 #define SMB2_KEY_SIZE 16
+/* AES-256 encryption keys */
+#define SMB2_ENC_KEY_SIZE_MAX 32
 
 #define SMB2_MAX_VECTORS 256
 
@@ -219,6 +221,8 @@ struct smb2_context {
         const char *server;
         const char *share;
         const char *user;
+        /* Server: local account of the Kerberos client, from gss_localname */
+        char *local_user;
 
         /* Only used with --without-libkrb5 */
         const char *password;
@@ -252,10 +256,12 @@ struct smb2_context {
         uint8_t sign:1;
         /* SMB3 encryption keys derived; sealed clients refuse plaintext from here on */
         uint8_t enc_keys_ready:1;
+        /* server: the client's NEGOTIATE had an encryption context */
+        uint8_t enc_cap_offered:1;
         uint8_t signing_key[SMB2_KEY_SIZE];
         uint8_t application_key[SMB2_KEY_SIZE];
-        uint8_t serverin_key[SMB2_KEY_SIZE];
-        uint8_t serverout_key[SMB2_KEY_SIZE];
+        uint8_t serverin_key[SMB2_ENC_KEY_SIZE_MAX];
+        uint8_t serverout_key[SMB2_ENC_KEY_SIZE_MAX];
         uint8_t salt[SMB2_SALT_SIZE];
         uint16_t cypher;
         uint8_t preauthhash[SMB2_PREAUTH_HASH_SIZE];
@@ -478,6 +484,10 @@ void smb2_close_connecting_fds(struct smb2_context *smb2);
 #endif
 struct iovec;
 int smb2_quic_handshake_start(struct smb2_context *smb2);
+int smb2_quic_server_handshake_start(struct smb2_context *smb2,
+                                     const char *cert_file,
+                                     const char *key_file);
+int smb2_quic_listen(uint16_t port, int max_connections, int *out_fd);
 int smb2_quic_handshake_service(struct smb2_context *smb2);
 int smb2_quic_events(struct smb2_context *smb2);
 ssize_t smb2_quic_writev(struct smb2_context *smb2,

@@ -474,6 +474,7 @@ enum smb2_sec {
         SMB2_SEC_UNDEFINED = 0,
         SMB2_SEC_NTLMSSP,
         SMB2_SEC_KRB5,
+        SMB2_SEC_IAKERB,
 };
 
 /*
@@ -481,6 +482,13 @@ enum smb2_sec {
  * SMB2_SEC_UNDEFINED (use KRB if available or NTLM if not)
  * SMB2_SEC_NTLMSSP
  * SMB2_SEC_KRB5
+ * SMB2_SEC_IAKERB
+ *     IAKerb (Initial and Pass-Through Authentication Using Kerberos).
+ *     The client builds the Kerberos exchange locally and the SMB server
+ *     proxies it to a KDC the client cannot reach. The domain is the
+ *     Kerberos realm. The password is required, as for sec=krb5cc.
+ *     URL query: sec=iakerb
+ *     smb2_set_authentication(SMB2_SEC_IAKERB) selects the same path.
  */
 void smb2_set_authentication(struct smb2_context *smb2, int val);
 
@@ -495,6 +503,13 @@ void smb2_set_user(struct smb2_context *smb2, const char *user);
  * returns NULL if none
  */
 const char *smb2_get_user(struct smb2_context *smb2);
+
+/*
+ * Server: the local account a Kerberos client's principal maps to, as
+ * krb5's auth_to_local rules and localauth plugins (sssd, winbind) say.
+ * returns NULL for NTLMSSP sessions or when the principal has no mapping.
+ */
+const char *smb2_get_local_user(struct smb2_context *smb2);
 
 /*
  * Set the password that we will try to authenticate as.
@@ -1758,6 +1773,15 @@ struct smb2_server {
          * instead of having to sleep and hope.
          */
         volatile int listener_ready;
+        /*
+         * SMB2 over QUIC instead of TCP, when built with libquic: listen
+         * on UDP port "port", 443 if 0. quic_cert_file is the PEM
+         * certificate chain the server presents, quic_key_file its PEM
+         * private key.
+         */
+        int quic;
+        char quic_cert_file[256];
+        char quic_key_file[256];
 };
 
 int smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd);
