@@ -29,6 +29,11 @@
  *   a-destroy-sent              close sent, no reply yet, destroy
  *   a-destroy-dead              smbd child killed, close queued, destroy
  *   a-destroy-open              destroy with the handles never closed
+ *   a-silent-then-close         smbd child stopped, client shutdown, then
+ *                               close (NOTICK=1 disables the 1 s tick)
+ *   a-destroy-kick              smbd child killed, close issued on the
+ *                               broken socket, destroy before the
+ *                               completion that services it is dequeued
  *   a-double-close              fh[0] closed twice on a dead session
  *                               (caller misuse, shows what it costs)
  *
@@ -85,6 +90,8 @@ static int g_completions;
 static int g_released_after_destroy;
 static ULONGLONG g_last_tick;
 static const char *g_scenario;
+static int g_in_close_call;
+static int g_cb_inside_close_call;
 
 static volatile const char *g_step = "start";
 static volatile ULONGLONG g_step_deadline;
@@ -160,8 +167,9 @@ dump_state(const char *when)
                         list_len(g_smb2->waitqueue), (void *)g_smb2->pdu,
                         smb2_get_error(g_smb2));
         }
-        fprintf(stderr, "iocp_complete<0=%d service<0=%d completions=%d\n",
-                g_iocp_fail, g_service_fail, g_completions);
+        fprintf(stderr, "iocp_complete<0=%d service<0=%d completions=%d "
+                "cb_inside_close_call=%d\n", g_iocp_fail, g_service_fail,
+                g_completions, g_cb_inside_close_call);
         for (i = 0; i < NFH; i++) {
                 fprintf(stderr, "    fh[%d]=%p close_rc=%d cb_fired=%d "
                         "cb_status=%d freed=%ld\n", i, (void *)g_fh[i].fh,
@@ -211,7 +219,8 @@ pump_once(DWORD timeout)
                 }
         }
         now = GetTickCount64();
-        if (g_smb2 != NULL && now - g_last_tick >= TICK_MS) {
+        if (g_smb2 != NULL && now - g_last_tick >= TICK_MS &&
+            getenv("NOTICK") == NULL) {
                 g_last_tick = now;
                 if (smb2_service(g_smb2, 0) < 0) {
                         if (g_service_fail++ < 3) {
@@ -332,6 +341,9 @@ close_cb(struct smb2_context *smb2, int status, void *cd, void *pd)
         struct fhrec *r = pd;
 
         r->cb_fired++;
+        if (g_in_close_call) {
+                g_cb_inside_close_call++;
+        }
         r->cb_status = status;
         /* touch the context from the callback, as a real caller would */
         r->cb_ctx_error = smb2_get_error(smb2);
@@ -529,8 +541,10 @@ close_all_async(void)
         int i;
 
         for (i = 0; i < NFH; i++) {
+                g_in_close_call = 1;
                 g_fh[i].close_rc = smb2_close_async(g_smb2, g_fh[i].fh,
                                                     close_cb, &g_fh[i]);
+                g_in_close_call = 0;
                 fprintf(stderr, "  smb2_close_async fh[%d] rc=%d\n", i,
                         g_fh[i].close_rc);
         }
@@ -714,6 +728,33 @@ run(const char *sc)
                         smb2_close_async(g_smb2, g_fh[0].fh, close_cb,
                                          &g_fh[0]));
                 pump_for(1500);
+        } else if (!strcmp(sc, "a-silent-then-close")) {
+                ULONGLONG t0;
+
+                step("stop server", 30);
+                if (kill_server(1) < 0) {
+                        return 2;
+                }
+                drop_client(0);
+                pump_for(1500);
+                dump_state("silent, before close");
+                step("close", 60);
+                t0 = GetTickCount64();
+                close_all_async();
+                dump_state("after close_async");
+                wait_close_cbs(WAIT_MS);
+                fprintf(stderr, "  close callbacks after %llu ms\n",
+                        GetTickCount64() - t0);
+                signal_smbd("CONT");
+        } else if (!strcmp(sc, "a-destroy-kick")) {
+                step("drop", 30);
+                if (kill_server(0) < 0) {
+                        return 2;
+                }
+                pump_for(2500);
+                step("close", 30);
+                close_all_async();
+                dump_state("issued, not pumped");
         } else if (!strcmp(sc, "a-destroy-dead")) {
                 step("drop", 30);
                 if (kill_server(0) < 0) {
