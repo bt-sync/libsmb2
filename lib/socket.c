@@ -1346,7 +1346,7 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                         if (smb2->connecting_fds_count > 0) {
                                 /* other addresses are still being tried */
                                 ret = 0;
-                                goto out;
+                                goto iocp_out;
                         }
                         ret = -1;
                         smb2_set_error(smb2, "smb2_service: socket error "
@@ -1356,7 +1356,7 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                                 smb2->connect_cb(smb2, err, NULL, smb2->connect_data);
                                 smb2->connect_cb = NULL;
                         }
-                        goto out;
+                        goto iocp_out;
                 }
                 if (ret == SMB2_IOCP_CONNECTED) {
                         ret = 0;
@@ -1368,7 +1368,7 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                         }
                 }
                 if (ret < 0 || !SMB2_VALID_SOCKET(smb2->fd)) {
-                        goto out;
+                        goto iocp_out;
                 }
                 if (smb2_read_from_socket(smb2) != 0) {
                         /* A callback closing the connection (disconnect,
@@ -1377,17 +1377,26 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                          * failure of this call. A read error leaves the
                          * socket open. */
                         ret = SMB2_VALID_SOCKET(smb2->fd) ? -1 : 0;
-                        goto out;
+                        goto iocp_out;
                 }
                 if (!SMB2_VALID_SOCKET(smb2->fd)) {
-                        goto out;
+                        goto iocp_out;
                 }
                 if (smb2->outqueue != NULL &&
                     smb2_write_to_socket(smb2) != 0) {
                         ret = -1;
-                        goto out;
+                        goto iocp_out;
                 }
                 if (smb2_iocp_flush(smb2) < 0) {
+                        ret = -1;
+                }
+  iocp_out:
+                /* No reply can come on a broken connection: fail what is
+                 * queued and waiting now, once the replies that did arrive
+                 * have been processed above. */
+                if (smb2_iocp_broken(smb2)) {
+                        smb2_fail_pdus(smb2,
+                                       SMB2_STATUS_CONNECTION_DISCONNECTED);
                         ret = -1;
                 }
                 goto out;

@@ -70,6 +70,7 @@ enum iocp_op_kind {
         IOCP_OP_CONNECT,
         IOCP_OP_RECV,
         IOCP_OP_SEND,
+        IOCP_OP_KICK,
 };
 
 struct smb2_iocp_op {
@@ -94,6 +95,8 @@ struct smb2_iocp_sock {
         struct smb2_iocp_op connect_op;
         struct smb2_iocp_op recv_op;
         struct smb2_iocp_op send_op;
+        /* posted to the port to get the context serviced, see kick() */
+        struct smb2_iocp_op kick_op;
 
         int connect_finished;           /* ConnectEx completed ... */
         DWORD connect_err;              /* ... with this error */
@@ -169,6 +172,40 @@ op_failed(struct smb2_iocp_op *op)
 {
         op->pending = 0;
         sock_unref(op->sock);
+}
+
+/*
+ * A connected socket that can carry no more traffic: a send failed, or a
+ * receive failed or saw the end of the stream and everything received
+ * before that has been read.
+ */
+static int
+sock_broken(struct smb2_iocp_sock *sk)
+{
+        return sk->tx_err ||
+                ((sk->rx_err || sk->rx_eof) && sk->rx_pos == sk->rx_len);
+}
+
+/*
+ * Get the context serviced from the port soon, without calling back into
+ * it from here: PDUs queued on a broken socket are then failed, see
+ * smb2_iocp_broken(). Nothing else would wake it up, as no operation is in
+ * flight on such a socket.
+ */
+static void
+kick(struct smb2_iocp_sock *sk)
+{
+        struct smb2_context *smb2 = sk->smb2;
+
+        if (sk->kick_op.pending || smb2 == NULL) {
+                return;
+        }
+        op_start(&sk->kick_op);
+        if (!PostQueuedCompletionStatus((HANDLE)smb2->iocp_port, 0,
+                                        (ULONG_PTR)smb2->iocp_key,
+                                        &sk->kick_op.ov)) {
+                op_failed(&sk->kick_op);
+        }
 }
 
 /* Win32/Winsock errors of a failed connect, as the errno values the
@@ -288,6 +325,7 @@ smb2_iocp_connect(struct smb2_context *smb2, const struct addrinfo *ai,
         op_init(sk, &sk->connect_op, IOCP_OP_CONNECT);
         op_init(sk, &sk->recv_op, IOCP_OP_RECV);
         op_init(sk, &sk->send_op, IOCP_OP_SEND);
+        op_init(sk, &sk->kick_op, IOCP_OP_KICK);
         sk->rx_buf = malloc(IOCP_RX_SIZE);
         sk->tx_buf = malloc(IOCP_TX_SIZE);
         if (sk->rx_buf == NULL || sk->tx_buf == NULL) {
@@ -382,8 +420,9 @@ smb2_iocp_close(struct smb2_context *smb2, t_socket fd)
 /*
  * Report what changed since the last call, for smb2_service_fd():
  * SMB2_IOCP_CONNECTED or SMB2_IOCP_CONNECT_FAILED (with the socket in *fd
- * and, on failure, the errno value in *err), -1 if a send failed, else 0.
- * A failed receive is reported by smb2_iocp_readv().
+ * and, on failure, the errno value in *err), else 0. A failed send or
+ * receive is reported by smb2_iocp_broken() once the replies received
+ * before it have been read.
  */
 int
 smb2_iocp_service(struct smb2_context *smb2, t_socket *fd, int *err)
@@ -408,13 +447,31 @@ smb2_iocp_service(struct smb2_context *smb2, t_socket *fd, int *err)
                 sk->connected = 1;
                 return SMB2_IOCP_CONNECTED;
         }
-        sk = connected_sock(smb2);
-        if (sk != NULL && sk->tx_err) {
+        return 0;
+}
+
+/*
+ * 1 if the connected socket is broken, with the reason set as the error.
+ * The context then has to fail its PDUs itself: no reply will come.
+ */
+int
+smb2_iocp_broken(struct smb2_context *smb2)
+{
+        struct smb2_iocp_sock *sk = connected_sock(smb2);
+
+        if (sk == NULL || !sock_broken(sk)) {
+                return 0;
+        }
+        if (sk->tx_err) {
                 smb2_set_error(smb2, "Error when writing to socket: %lu",
                                sk->tx_err);
-                return -1;
+        } else if (sk->rx_err) {
+                smb2_set_error(smb2, "Error when reading from socket: %lu",
+                               sk->rx_err);
+        } else {
+                smb2_set_error(smb2, "Server closed the connection");
         }
-        return 0;
+        return 1;
 }
 
 /* Start sending what was queued, and keep a receive in flight */
@@ -448,7 +505,12 @@ smb2_iocp_writev(struct smb2_context *smb2, const struct iovec *iov,
         ssize_t count = 0;
         int i;
 
-        if (sk == NULL || sk->tx_err) {
+        if (sk == NULL) {
+                errno = EPIPE;
+                return -1;
+        }
+        if (sock_broken(sk)) {
+                kick(sk);
                 errno = EPIPE;
                 return -1;
         }
@@ -469,6 +531,7 @@ smb2_iocp_writev(struct smb2_context *smb2, const struct iovec *iov,
                 count += (ssize_t)len;
         }
         if (!sk->send_op.pending && start_send(sk) < 0) {
+                kick(sk);
                 errno = EPIPE;
                 return -1;
         }
@@ -570,6 +633,8 @@ smb2_iocp_complete(void *overlapped, unsigned long bytes,
                         sk->tx_len -= bytes;
                 }
                 sk->tx_sending = 0;
+                break;
+        case IOCP_OP_KICK:
                 break;
         }
 

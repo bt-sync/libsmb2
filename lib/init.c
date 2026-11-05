@@ -458,6 +458,74 @@ void smb2_add_active_context(struct smb2_context *smb2)
         smb2->on_active_list = 1;
 }
 
+/*
+ * Complete every PDU of the context with status, as if the server had
+ * answered them all with it. For a context whose connection is gone.
+ */
+void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status)
+{
+        /*
+         * Complete every PDU that is still queued with status.
+         * A callback may queue another PDU (e.g. close a file when its read
+         * fails), so repeat until all the queues are empty.
+         */
+        while (smb2->outqueue || smb2->pdu || smb2->next_pdu ||
+               smb2->waitqueue) {
+                while (smb2->outqueue) {
+                        struct smb2_pdu *pdu = smb2->outqueue;
+                        struct smb2_pdu *p;
+
+                        smb2->outqueue = pdu->next;
+                        /*
+                         * An unsent compound is still chained: every PDU
+                         * in it has its own callback, and smb2_free_pdu()
+                         * frees the whole chain.
+                         */
+                        for (p = pdu; p; p = p->next_compound) {
+                                if (p->cb) {
+                                        p->cb(smb2, status,
+                                              NULL, p->cb_data);
+                                }
+                        }
+                        smb2_free_pdu(smb2, pdu);
+                }
+                if (smb2->pdu) {
+                        struct smb2_pdu *pdu = smb2->pdu;
+
+                        smb2->pdu = NULL;
+                        if (pdu->cb) {
+                                pdu->cb(smb2, status, NULL,
+                                        pdu->cb_data);
+                        }
+                        smb2_free_pdu(smb2, pdu);
+                }
+                if (smb2->next_pdu) {
+                        struct smb2_pdu *pdu = smb2->next_pdu;
+
+                        smb2->next_pdu = NULL;
+                        if (pdu->cb) {
+                                pdu->cb(smb2, status, NULL,
+                                        pdu->cb_data);
+                        }
+                        smb2_free_pdu(smb2, pdu);
+                }
+                while (smb2->waitqueue) {
+                        struct smb2_pdu *pdu = smb2->waitqueue;
+
+                        smb2->waitqueue = pdu->next;
+                        if (pdu->cb) {
+                                pdu->cb(smb2, status, NULL,
+                                        pdu->cb_data);
+                        }
+                        if (pdu == smb2->pdu) {
+                                smb2->pdu = NULL;
+                        }
+                        smb2_free_pdu(smb2, pdu);
+                }
+        }
+        smb2_free_iovector(smb2, &smb2->in);
+}
+
 void smb2_destroy_context(struct smb2_context *smb2)
 {
         if (smb2 == NULL) {
@@ -476,66 +544,7 @@ void smb2_destroy_context(struct smb2_context *smb2)
         smb2_quic_reset(smb2);
         smb2_rdma_reset(smb2);
 
-        /*
-         * Complete every PDU that is still queued with SMB2_STATUS_SHUTDOWN.
-         * A callback may queue another PDU (e.g. close a file when its read
-         * fails), so repeat until all the queues are empty.
-         */
-        while (smb2->outqueue || smb2->pdu || smb2->next_pdu ||
-               smb2->waitqueue) {
-                while (smb2->outqueue) {
-                        struct smb2_pdu *pdu = smb2->outqueue;
-                        struct smb2_pdu *p;
-
-                        smb2->outqueue = pdu->next;
-                        /*
-                         * An unsent compound is still chained: every PDU
-                         * in it has its own callback, and smb2_free_pdu()
-                         * frees the whole chain.
-                         */
-                        for (p = pdu; p; p = p->next_compound) {
-                                if (p->cb) {
-                                        p->cb(smb2, SMB2_STATUS_SHUTDOWN,
-                                              NULL, p->cb_data);
-                                }
-                        }
-                        smb2_free_pdu(smb2, pdu);
-                }
-                if (smb2->pdu) {
-                        struct smb2_pdu *pdu = smb2->pdu;
-
-                        smb2->pdu = NULL;
-                        if (pdu->cb) {
-                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
-                                        pdu->cb_data);
-                        }
-                        smb2_free_pdu(smb2, pdu);
-                }
-                if (smb2->next_pdu) {
-                        struct smb2_pdu *pdu = smb2->next_pdu;
-
-                        smb2->next_pdu = NULL;
-                        if (pdu->cb) {
-                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
-                                        pdu->cb_data);
-                        }
-                        smb2_free_pdu(smb2, pdu);
-                }
-                while (smb2->waitqueue) {
-                        struct smb2_pdu *pdu = smb2->waitqueue;
-
-                        smb2->waitqueue = pdu->next;
-                        if (pdu->cb) {
-                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
-                                        pdu->cb_data);
-                        }
-                        if (pdu == smb2->pdu) {
-                                smb2->pdu = NULL;
-                        }
-                        smb2_free_pdu(smb2, pdu);
-                }
-        }
-        smb2_free_iovector(smb2, &smb2->in);
+        smb2_fail_pdus(smb2, SMB2_STATUS_SHUTDOWN);
 
         if (smb2->connect_cb) {
            smb2->connect_cb(smb2, SMB2_STATUS_CANCELLED,

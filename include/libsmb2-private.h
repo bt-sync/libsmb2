@@ -529,6 +529,7 @@ int smb2_iocp_connect(struct smb2_context *smb2, const struct addrinfo *ai,
                       t_socket *fd_out);
 int smb2_iocp_service(struct smb2_context *smb2, t_socket *fd, int *err);
 int smb2_iocp_flush(struct smb2_context *smb2);
+int smb2_iocp_broken(struct smb2_context *smb2);
 ssize_t smb2_iocp_writev(struct smb2_context *smb2,
                          const struct iovec *iov, int iovcnt);
 ssize_t smb2_iocp_readv(struct smb2_context *smb2,
@@ -868,6 +869,7 @@ int smb2_decode_reparse_data_buffer(struct smb2_context *smb2,
 int smb2_read_from_buf(struct smb2_context *smb2);
 void smb2_change_events(struct smb2_context *smb2, t_socket fd, int events);
 void smb2_timeout_pdus(struct smb2_context *smb2);
+void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status);
 
 struct connect_data;                                           /* defined in libsmb2.c */
 void free_c_data(struct smb2_context*, struct connect_data*);  /* defined in libsmb2.c */
