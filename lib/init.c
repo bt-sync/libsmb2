@@ -487,7 +487,9 @@ void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status)
                                               NULL, p->cb_data);
                                 }
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
                 if (smb2->pdu) {
                         struct smb2_pdu *pdu = smb2->pdu;
@@ -497,7 +499,9 @@ void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status)
                                 pdu->cb(smb2, status, NULL,
                                         pdu->cb_data);
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
                 if (smb2->next_pdu) {
                         struct smb2_pdu *pdu = smb2->next_pdu;
@@ -507,7 +511,9 @@ void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status)
                                 pdu->cb(smb2, status, NULL,
                                         pdu->cb_data);
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
                 while (smb2->waitqueue) {
                         struct smb2_pdu *pdu = smb2->waitqueue;
@@ -520,7 +526,9 @@ void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status)
                         if (pdu == smb2->pdu) {
                                 smb2->pdu = NULL;
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
         }
         smb2_free_iovector(smb2, &smb2->in);

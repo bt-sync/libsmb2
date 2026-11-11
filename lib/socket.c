@@ -1534,13 +1534,13 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                         smb2->connect_cb = NULL;
                 }
                 ret = -1;
-                goto out;
+                goto disconnected;
         }
         if (revents & POLLHUP) {
                 smb2_set_error(smb2, "smb2_service: POLLHUP, "
                                 "socket error.");
                 ret = -1;
-                goto out;
+                goto disconnected;
         }
 
         if (!SMB2_VALID_SOCKET(smb2->fd) && revents & POLLOUT) {
@@ -1589,17 +1589,22 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
         if (revents & POLLIN) {
                 if (smb2_read_from_socket(smb2) != 0) {
                         ret = -1;
-                        goto out;
+                        goto disconnected;
                 }
         }
 
         if (revents & POLLOUT && smb2->outqueue != NULL) {
                 if (smb2_write_to_socket(smb2) != 0) {
                         ret = -1;
-                        goto out;
+                        goto disconnected;
                 }
         }
+        goto out;
 
+  disconnected:
+        if (fd == smb2->fd && !smb2_is_server(smb2)) {
+                smb2_fail_pdus(smb2, SMB2_STATUS_CONNECTION_DISCONNECTED);
+        }
   out:
         if (smb2->timeout) {
                 smb2_timeout_pdus(smb2);
