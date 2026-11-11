@@ -369,9 +369,9 @@ void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
 #include <openssl/evp.h>
 
 /*
- * The MAC context is keyed once per signing key and reinitialised for
- * every PDU: fetching the algorithm and expanding the key each time costs
- * more than the MAC itself on a small PDU.
+ * The MAC context is created once per signing key and reinitialised for
+ * every PDU: fetching the algorithm and allocating the context each time
+ * costs more than the MAC itself on a small PDU.
  */
 static EVP_MAC_CTX *smb2_sign_ctx(struct smb2_context *smb2)
 {
@@ -414,8 +414,8 @@ static int smb2_openssl_mac(struct smb2_context *smb2, const struct smb2_iovec *
         if (ctx == NULL) {
                 return -1;
         }
-        /* a NULL key restarts the MAC with the key it already holds */
-        if (EVP_MAC_init(ctx, NULL, 0, NULL) != 1) {
+        /* restarting with a NULL key gives wrong CMACs (OpenSSL 3.5) */
+        if (EVP_MAC_init(ctx, smb2->signing_key, SMB2_KEY_SIZE, NULL) != 1) {
                 goto err;
         }
         for (i = 0; i < niov; i++) {
