@@ -264,6 +264,10 @@ struct smb2_context {
         uint8_t serverout_key[SMB2_ENC_KEY_SIZE_MAX];
         uint8_t salt[SMB2_SALT_SIZE];
         uint16_t cypher;
+        /* OpenSSL contexts keyed with the keys above, see smb2_crypto_reset() */
+        void *sign_ctx;
+        void *seal_ctx;
+        void *unseal_ctx;
         uint8_t preauthhash[SMB2_PREAUTH_HASH_SIZE];
         /* on the list smb2_active_contexts() returns: a server's context */
         int on_active_list;
@@ -589,6 +593,11 @@ int smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                        struct smb2_header *hdr);
 int smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
                         struct smb2_iovec *iov, size_t niov);
+/*
+ * Frees the OpenSSL contexts keyed with the signing and sealing keys.
+ * Has to be called whenever those keys change, they are rebuilt on use.
+ */
+void smb2_crypto_reset(struct smb2_context *smb2);
 
 int smb2_set_uint8(struct smb2_iovec *iov, int offset, uint8_t value);
 int smb2_set_uint16(struct smb2_iovec *iov, int offset, uint16_t value);

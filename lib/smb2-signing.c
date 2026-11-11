@@ -368,44 +368,83 @@ void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
 
-static int smb2_openssl_mac(const char *name, const char *param, const char *value,
-                            const uint8_t key[SMB2_KEY_SIZE], const struct smb2_iovec *iov,
-                            size_t niov, uint8_t mac[32])
+/*
+ * The MAC context is keyed once per signing key and reinitialised for
+ * every PDU: fetching the algorithm and expanding the key each time costs
+ * more than the MAC itself on a small PDU.
+ */
+static EVP_MAC_CTX *smb2_sign_ctx(struct smb2_context *smb2)
 {
         EVP_MAC *m;
-        EVP_MAC_CTX *ctx = NULL;
+        EVP_MAC_CTX *ctx;
         OSSL_PARAM params[2];
-        size_t i, len;
-        int rc = -1;
+        int cmac = smb2->dialect > SMB2_VERSION_0210;
 
-        m = EVP_MAC_fetch(NULL, name, NULL);
+        if (smb2->sign_ctx != NULL) {
+                return smb2->sign_ctx;
+        }
+        m = EVP_MAC_fetch(NULL, cmac ? OSSL_MAC_NAME_CMAC : OSSL_MAC_NAME_HMAC, NULL);
         if (m == NULL) {
-                return -1;
+                return NULL;
         }
         ctx = EVP_MAC_CTX_new(m);
+        EVP_MAC_free(m);
         if (ctx == NULL) {
-                goto out;
+                return NULL;
         }
-        params[0] = OSSL_PARAM_construct_utf8_string(param, (char *)value, 0);
+        params[0] = cmac ?
+                OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, "AES-128-CBC", 0) :
+                OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0);
         params[1] = OSSL_PARAM_construct_end();
-        if (EVP_MAC_init(ctx, key, SMB2_KEY_SIZE, params) != 1) {
-                goto out;
+        if (EVP_MAC_init(ctx, smb2->signing_key, SMB2_KEY_SIZE, params) != 1) {
+                EVP_MAC_CTX_free(ctx);
+                return NULL;
+        }
+        smb2->sign_ctx = ctx;
+        return ctx;
+}
+
+static int smb2_openssl_mac(struct smb2_context *smb2, const struct smb2_iovec *iov,
+                            size_t niov, uint8_t mac[32])
+{
+        EVP_MAC_CTX *ctx;
+        size_t i, len;
+
+        ctx = smb2_sign_ctx(smb2);
+        if (ctx == NULL) {
+                return -1;
+        }
+        /* a NULL key restarts the MAC with the key it already holds */
+        if (EVP_MAC_init(ctx, NULL, 0, NULL) != 1) {
+                goto err;
         }
         for (i = 0; i < niov; i++) {
                 if (iov[i].len && EVP_MAC_update(ctx, iov[i].buf, iov[i].len) != 1) {
-                        goto out;
+                        goto err;
                 }
         }
         if (EVP_MAC_final(ctx, mac, &len, 32) != 1) {
-                goto out;
+                goto err;
         }
-        rc = 0;
- out:
+        return 0;
+ err:
         EVP_MAC_CTX_free(ctx);
-        EVP_MAC_free(m);
-        return rc;
+        smb2->sign_ctx = NULL;
+        return -1;
 }
 #endif
+
+void smb2_crypto_reset(struct smb2_context *smb2)
+{
+#ifdef HAVE_OPENSSL
+        EVP_MAC_CTX_free(smb2->sign_ctx);
+        EVP_CIPHER_CTX_free(smb2->seal_ctx);
+        EVP_CIPHER_CTX_free(smb2->unseal_ctx);
+#endif
+        smb2->sign_ctx = NULL;
+        smb2->seal_ctx = NULL;
+        smb2->unseal_ctx = NULL;
+}
 
 int
 smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
@@ -418,16 +457,8 @@ smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
 #ifdef HAVE_OPENSSL
         {
                 uint8_t mac[32];
-                int rc;
 
-                if (smb2->dialect > SMB2_VERSION_0210) {
-                        rc = smb2_openssl_mac(OSSL_MAC_NAME_CMAC, OSSL_MAC_PARAM_CIPHER, "AES-128-CBC",
-                                              smb2->signing_key, iov, niov, mac);
-                } else {
-                        rc = smb2_openssl_mac(OSSL_MAC_NAME_HMAC, OSSL_MAC_PARAM_DIGEST, "SHA256",
-                                              smb2->signing_key, iov, niov, mac);
-                }
-                if (rc) {
+                if (smb2_openssl_mac(smb2, iov, niov, mac)) {
                         smb2_set_error(smb2, "Failed to calculate the signature");
                         return -1;
                 }

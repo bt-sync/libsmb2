@@ -551,6 +551,7 @@ void smb2_destroy_context(struct smb2_context *smb2)
                          NULL, smb2->connect_data);
            smb2->connect_cb = NULL;
         }
+        smb2_crypto_reset(smb2);
         free(smb2->session_key);
         smb2->session_key = NULL;
 

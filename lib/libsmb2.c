@@ -223,6 +223,7 @@ smb2_close_context(struct smb2_context *smb2)
         smb2->tree_id[0] = 0xdeadbeef;
         memset(smb2->signing_key, 0, SMB2_KEY_SIZE);
         memset(smb2->application_key, 0, SMB2_KEY_SIZE);
+        smb2_crypto_reset(smb2);
         if (smb2->session_key) {
                 free(smb2->session_key);
                 smb2->session_key = NULL;
@@ -799,6 +800,7 @@ smb2_request_security_mode(struct smb2_context *smb2)
 
 static void smb2_create_signing_key(struct smb2_context *smb2)
 {
+        smb2_crypto_reset(smb2);
         /* Derive the signing key from session key
          * This is based on negotiated protocol
          */
@@ -5044,6 +5046,7 @@ smb2_server_retire_session(struct smb2_server *server, struct smb2_context *smb2
         memset(smb2->application_key, 0, SMB2_KEY_SIZE);
         memset(smb2->serverin_key, 0, sizeof(smb2->serverin_key));
         memset(smb2->serverout_key, 0, sizeof(smb2->serverout_key));
+        smb2_crypto_reset(smb2);
         smb2->enc_keys_ready = 0;
         smb2->session_id = 0;
         memcpy(smb2->preauthhash, smb2->negotiate_preauthhash, SMB2_PREAUTH_HASH_SIZE);

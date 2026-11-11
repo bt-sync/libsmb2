@@ -71,34 +71,6 @@ static const char xfer[4] = {0xFD, 'S', 'M', 'B'};
 #include <limits.h>
 #include <openssl/evp.h>
 
-static int smb3_aesgcm(int enc, uint16_t cypher, uint8_t *key, uint8_t nonce[12], uint8_t aad[32],
-                       uint8_t *p, size_t plen, uint8_t tag[16])
-{
-        EVP_CIPHER_CTX *ctx;
-        int outl, rc = -1;
-
-        if (plen > INT_MAX) {
-                return -1;
-        }
-        ctx = EVP_CIPHER_CTX_new();
-        if (ctx == NULL) {
-                return -1;
-        }
-        if (EVP_CipherInit_ex(ctx, cypher == SMB2_ENCRYPTION_AES_256_GCM ? EVP_aes_256_gcm() : EVP_aes_128_gcm(),
-                              NULL, key, nonce, enc) != 1 ||
-            EVP_CipherUpdate(ctx, NULL, &outl, aad, 32) != 1 ||
-            EVP_CipherUpdate(ctx, p, &outl, p, (int)plen) != 1 ||
-            (!enc && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, tag) != 1) ||
-            EVP_CipherFinal_ex(ctx, p + outl, &outl) != 1 ||
-            (enc && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1)) {
-                goto out;
-        }
-        rc = 0;
- out:
-        EVP_CIPHER_CTX_free(ctx);
-        return rc;
-}
-
 #define SMB3_GCM(smb2) ((smb2)->cypher == SMB2_ENCRYPTION_AES_128_GCM || \
                         (smb2)->cypher == SMB2_ENCRYPTION_AES_256_GCM)
 #else
@@ -111,6 +83,80 @@ static int smb3_aesgcm(int enc, uint16_t cypher, uint8_t *key, uint8_t nonce[12]
                         (smb2)->serverout_key : (smb2)->serverin_key)
 #define UNSEAL_KEY(smb2) (smb2_is_server(smb2) ? \
                           (smb2)->serverin_key : (smb2)->serverout_key)
+
+#ifdef HAVE_OPENSSL
+/*
+ * One cipher context per direction, keyed once per session key. A PDU
+ * only sets a new nonce on it, which keeps the AES key schedule (and for
+ * GCM the GHASH tables) instead of rebuilding them every time.
+ */
+static EVP_CIPHER_CTX *smb3_cipher_ctx(struct smb2_context *smb2, int enc)
+{
+        void **slot = enc ? &smb2->seal_ctx : &smb2->unseal_ctx;
+        const EVP_CIPHER *cipher;
+        EVP_CIPHER_CTX *ctx;
+        int gcm = SMB3_GCM(smb2);
+
+        if (*slot != NULL) {
+                return *slot;
+        }
+        if (smb2->cypher == SMB2_ENCRYPTION_AES_256_GCM) {
+                cipher = EVP_aes_256_gcm();
+        } else if (gcm) {
+                cipher = EVP_aes_128_gcm();
+        } else {
+                cipher = EVP_aes_128_ccm();
+        }
+        ctx = EVP_CIPHER_CTX_new();
+        if (ctx == NULL) {
+                return NULL;
+        }
+        /* CCM takes the nonce and tag lengths before the key */
+        if (EVP_CipherInit_ex(ctx, cipher, NULL, NULL, NULL, enc) != 1 ||
+            (!gcm && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 11, NULL) != 1 ||
+                      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, NULL) != 1)) ||
+            EVP_CipherInit_ex(ctx, NULL, NULL, enc ? SEAL_KEY(smb2) : UNSEAL_KEY(smb2), NULL, enc) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return NULL;
+        }
+        *slot = ctx;
+        return ctx;
+}
+
+static int smb3_aead(struct smb2_context *smb2, int enc, uint8_t *nonce, uint8_t aad[32],
+                     uint8_t *p, size_t plen, uint8_t tag[16])
+{
+        EVP_CIPHER_CTX *ctx;
+        int gcm = SMB3_GCM(smb2);
+        int outl;
+
+        if (plen > INT_MAX) {
+                return -1;
+        }
+        ctx = smb3_cipher_ctx(smb2, enc);
+        if (ctx == NULL) {
+                return -1;
+        }
+        /* CCM authenticates while it decrypts, so it needs the tag first and has no final step */
+        if ((!enc && !gcm && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, tag) != 1) ||
+            EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, enc) != 1 ||
+            (!gcm && EVP_CipherUpdate(ctx, NULL, &outl, NULL, (int)plen) != 1) ||
+            EVP_CipherUpdate(ctx, NULL, &outl, aad, 32) != 1 ||
+            EVP_CipherUpdate(ctx, p, &outl, p, (int)plen) != 1 ||
+            (!enc && gcm && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, tag) != 1) ||
+            ((enc || gcm) && EVP_CipherFinal_ex(ctx, p + outl, &outl) != 1) ||
+            (enc && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1)) {
+                EVP_CIPHER_CTX_free(ctx);
+                if (enc) {
+                        smb2->seal_ctx = NULL;
+                } else {
+                        smb2->unseal_ctx = NULL;
+                }
+                return -1;
+        }
+        return 0;
+}
+#endif
 
 int
 smb3_encrypt_pdu(struct smb2_context *smb2,
@@ -174,16 +220,15 @@ smb3_encrypt_pdu(struct smb2_context *smb2,
         }
 
 #ifdef HAVE_OPENSSL
-        if (SMB3_GCM(smb2)) {
-                rc = smb3_aesgcm(1, smb2->cypher, SEAL_KEY(smb2), &pdu->crypt[20],
-                                 &pdu->crypt[20], &pdu->crypt[52], spl - 52, &pdu->crypt[4]);
-        } else
-#endif
+        rc = smb3_aead(smb2, 1, &pdu->crypt[20], &pdu->crypt[20],
+                       &pdu->crypt[52], spl - 52, &pdu->crypt[4]);
+#else
         rc = aes128ccm_encrypt(SEAL_KEY(smb2),
                                &pdu->crypt[20], 11,
                                &pdu->crypt[20], 32,
                                &pdu->crypt[52], spl - 52,
                                &pdu->crypt[4], 16);
+#endif
         if (rc) {
                 smb2_set_error(smb2, "Failed to encrypt PDU");
                 free(pdu->crypt);
@@ -203,13 +248,11 @@ smb3_do_decrypt_pdu(struct smb2_context *smb2)
         int rc;
 
 #ifdef HAVE_OPENSSL
-        if (SMB3_GCM(smb2)) {
-                rc = smb3_aesgcm(0, smb2->cypher, UNSEAL_KEY(smb2), &hdr[20], &hdr[20],
-                                 data->buf, data->len, &hdr[4]);
-        } else
-#endif
+        rc = smb3_aead(smb2, 0, &hdr[20], &hdr[20], data->buf, data->len, &hdr[4]);
+#else
         rc = aes128ccm_decrypt(UNSEAL_KEY(smb2), &hdr[20], 11, &hdr[20], 32,
                                data->buf, data->len, &hdr[4], 16);
+#endif
         if (rc) {
                 smb2_set_error(smb2, "Failed to decrypt PDU");
                 return -1;
