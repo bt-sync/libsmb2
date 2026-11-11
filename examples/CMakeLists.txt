@@ -25,6 +25,8 @@ set(SOURCES smb2-cat-async
 # build the ones written for it instead.
 if(WIN32)
   set(SOURCES smb2-cat-iocp smb2-close-disconnected)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND SOURCES smb2-close-disconnected)
 endif()
 
 set(DCERPC_SOURCES smb2-share-enum

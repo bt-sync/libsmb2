@@ -15,10 +15,15 @@
  * heap on every call, so writes after free and double frees are caught.
  * Run with PAGEHEAP=1 under gflags /p /full to catch reads after free.
  *
+ * On Linux, build with -fsanitize=address instead, and run as root (it
+ * signals the smbd child serving the connection, which runs locally).
+ *
  * Scenarios, a- drives the context through an I/O completion port the way
- * sync-core does, s- uses the synchronous API on a polled context:
+ * sync-core does on Windows, or through epoll with smb2_fd_event_callbacks()
+ * and smb2_service_fd(-1, 0) as the 1 s tick on Linux; s- uses the
+ * synchronous API on a polled context:
  *   a-healthy  s-healthy        close on a healthy session
- *   a-shutdown s-shutdown       shutdown(SD_BOTH) of the socket, then close
+ *   a-shutdown s-shutdown       shutdown() of the socket, then close
  *   a-closesocket s-closesocket closesocket() behind libsmb2's back
  *   a-kill     s-kill           kill -9 of the smbd child, then close
  *   a-kill-timeout              a-kill with smb2_set_timeout(3)
@@ -37,14 +42,31 @@
  *   a-double-close              fh[0] closed twice on a dead session
  *                               (caller misuse, shows what it costs)
  *
+ * The s- scenarios that drop the connection also call smb2_open() and
+ * smb2_opendir() on the dead session before closing.
+ *
  * With RAWFH=1 in the environment the a- scenarios open the files as
  * sync-core does: a raw CREATE, then smb2_fh_from_file_id().
  */
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 
 #include <crtdbg.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,14 +77,49 @@
 #include "libsmb2.h"
 #include "libsmb2-raw.h"
 /* only to look at the queues of the context */
+#ifdef _WIN32
 typedef SSIZE_T ssize_t;
 struct iovec;
+#endif
 #include "libsmb2-private.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ntdll.lib")
 ULONG WINAPI RtlNtStatusToDosError(LONG status);
 
 #define SMB2_KEY ((ULONG_PTR)4)
+#define AS_ROOT "wsl.exe -u root -e "
+#define SHUT_RDWR SD_BOTH
+#define popen _popen
+#define pclose _pclose
+#define getpid GetCurrentProcessId
+#define sleep_ms Sleep
+#define now_ms GetTickCount64
+#else
+#define AS_ROOT ""
+#define closesocket close
+#define WSAGetLastError() errno
+#define TRUE 1
+typedef unsigned long DWORD;
+typedef long LONG;
+typedef unsigned long long ULONGLONG;
+
+static ULONGLONG
+now_ms(void)
+{
+        struct timespec ts;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (ULONGLONG)ts.tv_sec * 1000 + (ULONGLONG)ts.tv_nsec / 1000000;
+}
+
+static void
+sleep_ms(DWORD ms)
+{
+        usleep(ms * 1000);
+}
+#endif
+
 #define NFH 3
 #define TICK_MS 1000
 #define WAIT_MS 10000
@@ -82,7 +139,11 @@ static struct fhrec g_fh[NFH];
 static volatile LONG g_ctx_freed;
 static struct smb2_context *g_smb2;
 
+#ifdef _WIN32
 static HANDLE g_port;
+#else
+static int g_epfd = -1;
+#endif
 static int g_async;
 static int g_iocp_fail;
 static int g_service_fail;
@@ -96,23 +157,32 @@ static int g_cb_inside_close_call;
 static volatile const char *g_step = "start";
 static volatile ULONGLONG g_step_deadline;
 
+static void
+note_free(const volatile void *data)
+{
+        int i;
+
+        if (data == NULL) {
+                return;
+        }
+        for (i = 0; i < NFH; i++) {
+                if ((const volatile void *)g_fh[i].fh == data) {
+                        g_fh[i].freed++;
+                }
+        }
+        if (g_smb2 != NULL && (const volatile void *)g_smb2 == data) {
+                g_ctx_freed++;
+        }
+}
+
+#ifdef _WIN32
 static int
 alloc_hook(int type, void *data, size_t size, int block_type, long request,
            const unsigned char *file, int line)
 {
-        int i;
-
         (void)size; (void)block_type; (void)request; (void)file; (void)line;
-        if (type != _HOOK_FREE || data == NULL) {
-                return TRUE;
-        }
-        for (i = 0; i < NFH; i++) {
-                if (g_fh[i].fh == data) {
-                        InterlockedIncrement(&g_fh[i].freed);
-                }
-        }
-        if (g_smb2 != NULL && data == g_smb2) {
-                InterlockedIncrement(&g_ctx_freed);
+        if (type == _HOOK_FREE) {
+                note_free(data);
         }
         return TRUE;
 }
@@ -123,7 +193,7 @@ watchdog(void *arg)
         (void)arg;
         for (;;) {
                 Sleep(200);
-                if (g_step_deadline && GetTickCount64() > g_step_deadline) {
+                if (g_step_deadline && now_ms() > g_step_deadline) {
                         fprintf(stderr, "WATCHDOG: HUNG in step '%s'\n",
                                 (const char *)g_step);
                         fflush(stderr);
@@ -134,12 +204,48 @@ watchdog(void *arg)
                 }
         }
 }
+#else
+#ifdef __SANITIZE_ADDRESS__
+void __sanitizer_free_hook(const volatile void *ptr);
+
+void
+__sanitizer_free_hook(const volatile void *ptr)
+{
+        note_free(ptr);
+}
+#else
+void __libc_free(void *ptr);
+
+void
+free(void *ptr)
+{
+        note_free(ptr);
+        __libc_free(ptr);
+}
+#endif
+
+static void *
+watchdog(void *arg)
+{
+        (void)arg;
+        for (;;) {
+                sleep_ms(200);
+                if (g_step_deadline && now_ms() > g_step_deadline) {
+                        fprintf(stderr, "WATCHDOG: HUNG in step '%s'\n",
+                                (const char *)g_step);
+                        fflush(stderr);
+                        _exit(3);
+                }
+        }
+        return NULL;
+}
+#endif
 
 static void
 step(const char *name, int seconds)
 {
         g_step = name;
-        g_step_deadline = seconds ? GetTickCount64() + seconds * 1000ULL : 0;
+        g_step_deadline = seconds ? now_ms() + seconds * 1000ULL : 0;
         fprintf(stderr, "--- %s\n", name);
 }
 
@@ -167,7 +273,7 @@ dump_state(const char *when)
                         list_len(g_smb2->waitqueue), (void *)g_smb2->pdu,
                         smb2_get_error(g_smb2));
         }
-        fprintf(stderr, "iocp_complete<0=%d service<0=%d completions=%d "
+        fprintf(stderr, "dispatch<0=%d tick<0=%d completions=%d "
                 "cb_inside_close_call=%d\n", g_iocp_fail, g_service_fail,
                 g_completions, g_cb_inside_close_call);
         for (i = 0; i < NFH; i++) {
@@ -178,6 +284,7 @@ dump_state(const char *when)
         }
 }
 
+#ifdef _WIN32
 static void
 dispatch(OVERLAPPED_ENTRY *e)
 {
@@ -218,7 +325,7 @@ pump_once(DWORD timeout)
                         dispatch(&entries[i]);
                 }
         }
-        now = GetTickCount64();
+        now = now_ms();
         if (g_smb2 != NULL && now - g_last_tick >= TICK_MS &&
             getenv("NOTICK") == NULL) {
                 g_last_tick = now;
@@ -230,12 +337,77 @@ pump_once(DWORD timeout)
                 }
         }
 }
+#else
+static void
+change_fd_cb(struct smb2_context *smb2, t_socket fd, int cmd)
+{
+        struct epoll_event ev;
+
+        (void)smb2;
+        memset(&ev, 0, sizeof(ev));
+        ev.data.fd = fd;
+        if (epoll_ctl(g_epfd, cmd == SMB2_ADD_FD ? EPOLL_CTL_ADD :
+                      EPOLL_CTL_DEL, fd, &ev) != 0) {
+                fprintf(stderr, "  epoll_ctl(%s, %d): %s\n",
+                        cmd == SMB2_ADD_FD ? "ADD" : "DEL", fd,
+                        strerror(errno));
+        }
+}
+
+static void
+change_events_cb(struct smb2_context *smb2, t_socket fd, int events)
+{
+        struct epoll_event ev;
+
+        (void)smb2;
+        memset(&ev, 0, sizeof(ev));
+        ev.data.fd = fd;
+        ev.events = (events & POLLIN ? EPOLLIN : 0) |
+                (events & POLLOUT ? EPOLLOUT : 0);
+        if (epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev) != 0) {
+                fprintf(stderr, "  epoll_ctl(MOD, %d, %d): %s\n", fd, events,
+                        strerror(errno));
+        }
+}
+
+/* One round of the sync-core epoll loop: events, then the 1 s tick */
+static void
+pump_once(DWORD timeout)
+{
+        struct epoll_event ev[8];
+        ULONGLONG now;
+        int n, i, rc;
+
+        n = epoll_wait(g_epfd, ev, 8, (int)timeout);
+        for (i = 0; i < n && g_smb2 != NULL; i++) {
+                g_completions++;
+                rc = smb2_service_fd(g_smb2, ev[i].data.fd,
+                                     (int)ev[i].events);
+                if (rc < 0 && g_iocp_fail++ < 3) {
+                        fprintf(stderr, "  smb2_service_fd(%d, 0x%x) rc=%d: "
+                                "%s\n", ev[i].data.fd, ev[i].events, rc,
+                                smb2_get_error(g_smb2));
+                }
+        }
+        now = now_ms();
+        if (g_smb2 != NULL && now - g_last_tick >= TICK_MS &&
+            getenv("NOTICK") == NULL) {
+                g_last_tick = now;
+                if (smb2_service_fd(g_smb2, -1, 0) < 0) {
+                        if (g_service_fail++ < 3) {
+                                fprintf(stderr, "  tick smb2_service_fd < 0: "
+                                        "%s\n", smb2_get_error(g_smb2));
+                        }
+                }
+        }
+}
+#endif
 
 /* Pump until *flag (or all of flags[n]) is set; 0 if done, -1 on timeout */
 static int
 pump_until(volatile int *flags, int n, int stride, DWORD ms)
 {
-        ULONGLONG end = GetTickCount64() + ms;
+        ULONGLONG end = now_ms() + ms;
         int i, done;
 
         for (;;) {
@@ -248,7 +420,7 @@ pump_until(volatile int *flags, int n, int stride, DWORD ms)
                 if (done) {
                         return 0;
                 }
-                if (GetTickCount64() >= end) {
+                if (now_ms() >= end) {
                         return -1;
                 }
                 pump_once(100);
@@ -258,9 +430,9 @@ pump_until(volatile int *flags, int n, int stride, DWORD ms)
 static void
 pump_for(DWORD ms)
 {
-        ULONGLONG end = GetTickCount64() + ms;
+        ULONGLONG end = now_ms() + ms;
 
-        while (GetTickCount64() < end) {
+        while (now_ms() < end) {
                 pump_once(50);
         }
 }
@@ -268,9 +440,9 @@ pump_for(DWORD ms)
 static void
 drain_after_destroy(void)
 {
-        ULONGLONG end = GetTickCount64() + 1000;
+        ULONGLONG end = now_ms() + 1000;
 
-        while (GetTickCount64() < end) {
+        while (now_ms() < end) {
                 pump_once(100);
         }
 }
@@ -358,7 +530,7 @@ static int
 local_port(void)
 {
         struct sockaddr_storage ss;
-        int len = sizeof(ss);
+        socklen_t len = sizeof(ss);
         t_socket fd = smb2_get_fd(g_smb2);
 
         if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0) {
@@ -374,7 +546,7 @@ static int
 collect_pids(const char *cmd, int *pids, int max)
 {
         char line[1024];
-        FILE *p = _popen(cmd, "r");
+        FILE *p = popen(cmd, "r");
         int n = 0, i, pid, dup;
         char *s;
 
@@ -394,7 +566,7 @@ collect_pids(const char *cmd, int *pids, int max)
                         }
                 }
         }
-        _pclose(p);
+        pclose(p);
         return n;
 }
 
@@ -407,11 +579,11 @@ find_smbd_child(int port, int server_port)
         char cmd[512];
         int conn[8], lst[8], nc, nl, i;
 
-        snprintf(cmd, sizeof(cmd), "wsl.exe -u root -e ss -tnpH state "
+        snprintf(cmd, sizeof(cmd), AS_ROOT "ss -tnpH state "
                  "established \"( sport = :%d and dport = :%d )\"",
                  server_port, port);
         nc = collect_pids(cmd, conn, 8);
-        snprintf(cmd, sizeof(cmd), "wsl.exe -u root -e ss -tlnpH "
+        snprintf(cmd, sizeof(cmd), AS_ROOT "ss -tlnpH "
                  "\"( sport = :%d )\"", server_port);
         nl = collect_pids(cmd, lst, 8);
         if (nc != 1) {
@@ -435,7 +607,7 @@ signal_smbd(const char *sig)
         char cmd[128];
         int rc;
 
-        snprintf(cmd, sizeof(cmd), "wsl.exe -u root -e kill -%s %d", sig,
+        snprintf(cmd, sizeof(cmd), AS_ROOT "kill -%s %d", sig,
                  g_smbd_pid);
         rc = system(cmd);
         fprintf(stderr, "  kill -%s %d: rc=%d\n", sig, g_smbd_pid, rc);
@@ -478,10 +650,15 @@ setup(int async, int timeout)
 
         step("connect", 30);
         if (async) {
+#ifdef _WIN32
                 if (smb2_iocp_attach(g_smb2, g_port, SMB2_KEY) < 0) {
                         fprintf(stderr, "attach: %s\n", smb2_get_error(g_smb2));
                         return -1;
                 }
+#else
+                smb2_fd_event_callbacks(g_smb2, change_fd_cb,
+                                        change_events_cb);
+#endif
                 if (smb2_connect_share_async(g_smb2, g_url->server,
                                              g_url->share, g_url->user,
                                              connect_cb, NULL) != 0 ||
@@ -502,7 +679,7 @@ setup(int async, int timeout)
                 snprintf(path, sizeof(path), "%s%sclose-disc-%s-%d-%lu.tmp",
                          g_url->path ? g_url->path : "",
                          g_url->path && *g_url->path ? "/" : "",
-                         g_scenario, i, GetCurrentProcessId());
+                         g_scenario, i, (unsigned long)getpid());
                 if (async) {
                         if ((getenv("RAWFH") ?
                              raw_open_async(path, &g_fh[i]) :
@@ -556,13 +733,28 @@ close_all_sync(void)
         int i;
 
         for (i = 0; i < NFH; i++) {
-                ULONGLONG t0 = GetTickCount64();
+                ULONGLONG t0 = now_ms();
 
                 g_fh[i].close_rc = smb2_close(g_smb2, g_fh[i].fh);
                 fprintf(stderr, "  smb2_close fh[%d] rc=%d (%llu ms) err='%s'"
-                        "\n", i, g_fh[i].close_rc, GetTickCount64() - t0,
+                        "\n", i, g_fh[i].close_rc, now_ms() - t0,
                         smb2_get_error(g_smb2));
         }
+}
+
+/* the sync calls that own their PDU (caller_frees_pdu) */
+static void
+sync_on_dead_session(void)
+{
+        struct smb2fh *fh;
+        struct smb2dir *dir;
+
+        fh = smb2_open(g_smb2, "close-disc-dead.tmp", O_RDONLY);
+        fprintf(stderr, "  smb2_open on the dead session: %p err='%s'\n",
+                (void *)fh, smb2_get_error(g_smb2));
+        dir = smb2_opendir(g_smb2, "");
+        fprintf(stderr, "  smb2_opendir on the dead session: %p err='%s'\n",
+                (void *)dir, smb2_get_error(g_smb2));
 }
 
 static int
@@ -582,8 +774,8 @@ drop_client(int how)
         int rc;
 
         if (how == 0) {
-                rc = shutdown(fd, SD_BOTH);
-                fprintf(stderr, "  shutdown(%lld, SD_BOTH)=%d (%d)\n",
+                rc = shutdown(fd, SHUT_RDWR);
+                fprintf(stderr, "  shutdown(%lld, both)=%d (%d)\n",
                         (long long)fd, rc, rc ? WSAGetLastError() : 0);
         } else {
                 rc = closesocket(fd);
@@ -599,12 +791,12 @@ destroy(void)
 
         step("destroy", 30);
         dump_state("before destroy");
-        t0 = GetTickCount64();
+        t0 = now_ms();
         smb2_destroy_url(g_url);
         g_url = NULL;
         smb2_destroy_context(g_smb2);
         fprintf(stderr, "  smb2_destroy_context took %llu ms, ctx freed=%ld\n",
-                GetTickCount64() - t0, g_ctx_freed);
+                now_ms() - t0, g_ctx_freed);
         g_smb2 = NULL;
         if (g_async) {
                 drain_after_destroy();
@@ -670,8 +862,9 @@ run(const char *sc)
                         dump_state("after close_async");
                         wait_close_cbs(timeout ? 8000 : WAIT_MS);
                 } else {
-                        Sleep(1000);
+                        sleep_ms(1000);
                         step("close", 60);
+                        sync_on_dead_session();
                         close_all_sync();
                 }
         } else if (!strcmp(sc, "a-inflight-queued")) {
@@ -739,12 +932,12 @@ run(const char *sc)
                 pump_for(1500);
                 dump_state("silent, before close");
                 step("close", 60);
-                t0 = GetTickCount64();
+                t0 = now_ms();
                 close_all_async();
                 dump_state("after close_async");
                 wait_close_cbs(WAIT_MS);
                 fprintf(stderr, "  close callbacks after %llu ms\n",
-                        GetTickCount64() - t0);
+                        now_ms() - t0);
                 signal_smbd("CONT");
         } else if (!strcmp(sc, "a-destroy-kick")) {
                 step("drop", 30);
@@ -780,9 +973,14 @@ run(const char *sc)
 int
 main(int argc, char *argv[])
 {
+#ifdef _WIN32
         _CrtMemState before, after, diff;
         WSADATA wsa;
-        int flags, rc, i, bad = 0;
+        int flags;
+#else
+        pthread_t wd;
+#endif
+        int rc, i, bad = 0;
 
         if (argc != 2) {
                 fprintf(stderr, "usage: %s <scenario>, SMB2_URL and "
@@ -792,6 +990,7 @@ main(int argc, char *argv[])
         g_scenario = argv[1];
         setvbuf(stderr, NULL, _IONBF, 0);
 
+#ifdef _WIN32
         flags = _CRTDBG_ALLOC_MEM_DF | _CRTDBG_CHECK_ALWAYS_DF |
                 _CRTDBG_LEAK_CHECK_DF;
         if (getenv("PAGEHEAP") == NULL) {
@@ -807,11 +1006,23 @@ main(int argc, char *argv[])
 
         WSAStartup(MAKEWORD(2, 2), &wsa);
         g_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
-        g_last_tick = GetTickCount64();
-
         fprintf(stderr, "scenario %s (%s heap)\n", g_scenario,
                 getenv("PAGEHEAP") ? "page" : "debug CRT, delayed free");
         _CrtMemCheckpoint(&before);
+#else
+        signal(SIGPIPE, SIG_IGN);
+        pthread_create(&wd, NULL, watchdog, NULL);
+        g_epfd = epoll_create1(EPOLL_CLOEXEC);
+        fprintf(stderr, "scenario %s (%s)\n", g_scenario,
+#ifdef __SANITIZE_ADDRESS__
+                "AddressSanitizer"
+#else
+                "glibc heap"
+#endif
+                );
+#endif
+        g_last_tick = now_ms();
+
         rc = run(g_scenario);
         if (rc == 0) {
                 step("final checks", 30);
@@ -820,6 +1031,10 @@ main(int argc, char *argv[])
                                 bad = 1;
                         }
                 }
+                if (g_ctx_freed != 1) {
+                        bad = 1;
+                }
+#ifdef _WIN32
                 fprintf(stderr, "_CrtCheckMemory: %s\n",
                         _CrtCheckMemory() ? "ok" : "CORRUPT");
                 _CrtMemCheckpoint(&after);
@@ -833,12 +1048,17 @@ main(int argc, char *argv[])
                 } else {
                         fprintf(stderr, "heap delta: none\n");
                 }
+#endif
                 fprintf(stderr, "RESULT %s: %s\n", g_scenario,
-                        bad ? "fh NOT freed exactly once" :
-                        "every fh freed exactly once");
+                        bad ? "fh or context NOT freed exactly once" :
+                        "every fh and the context freed exactly once");
         }
         step("exit", 0);
+#ifdef _WIN32
         CloseHandle(g_port);
         WSACleanup();
+#else
+        close(g_epfd);
+#endif
         return rc ? rc : bad;
 }
