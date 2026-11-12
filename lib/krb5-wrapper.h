@@ -64,6 +64,18 @@ struct private_auth_data {
         gss_const_OID mech_type;
         uint32_t req_flags;
         gss_buffer_desc output_token;
+        /* SPNEGO wrapping of output_token for SMB2_SEC_IAKERB. The GSS
+         * token stays in output_token; this is what goes on the wire. */
+        unsigned char *spnego_buf;
+        int spnego_len;
+        int iakerb_complete;
+        int iakerb_mic_verified;
+        /* Server: SPNEGO is done here when the client prefers IAKerb,
+         * because MIT's SPNEGO never negotiates it. */
+        gss_cred_id_t iakerb_cred;
+        int iakerb_server;
+        unsigned char *mech_types;
+        int mech_types_len;
         int get_proxy_cred;
         int use_spnego;
         char *g_server;

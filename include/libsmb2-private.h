@@ -55,6 +55,8 @@ extern "C" {
 
 #define SMB2_SIGNATURE_SIZE 16
 #define SMB2_KEY_SIZE 16
+/* AES-256 encryption keys */
+#define SMB2_ENC_KEY_SIZE_MAX 32
 
 #define SMB2_MAX_VECTORS 256
 
@@ -184,6 +186,21 @@ struct smb2_context {
         int rdma;
         struct smb2_rdma *rdma_conn;
 #endif
+#ifdef HAVE_SMB2_IOCP
+        /* smb2_iocp_attach(): overlapped I/O through the caller's I/O
+         * completion port instead of readiness polling, see smbiocp.c.
+         * iocp_socks are the sockets being connected, and the connected
+         * one (smb2->fd). */
+        void *iocp_port;
+        uintptr_t iocp_key;
+        struct smb2_iocp_sock *iocp_socks;
+#endif
+#ifdef HAVE_SSPI
+        /* smb2_set_sspi_cred(): a copy of the caller's CredHandle (not
+         * owned), see sspi-wrapper.c */
+        uintptr_t sspi_cred[2];
+        int sspi_cred_set;
+#endif
 
         enum smb2_sec sec;
 
@@ -204,6 +221,8 @@ struct smb2_context {
         const char *server;
         const char *share;
         const char *user;
+        /* Server: local account of the Kerberos client, from gss_localname */
+        char *local_user;
 
         /* Only used with --without-libkrb5 */
         const char *password;
@@ -237,12 +256,18 @@ struct smb2_context {
         uint8_t sign:1;
         /* SMB3 encryption keys derived; sealed clients refuse plaintext from here on */
         uint8_t enc_keys_ready:1;
+        /* server: the client's NEGOTIATE had an encryption context */
+        uint8_t enc_cap_offered:1;
         uint8_t signing_key[SMB2_KEY_SIZE];
         uint8_t application_key[SMB2_KEY_SIZE];
-        uint8_t serverin_key[SMB2_KEY_SIZE];
-        uint8_t serverout_key[SMB2_KEY_SIZE];
+        uint8_t serverin_key[SMB2_ENC_KEY_SIZE_MAX];
+        uint8_t serverout_key[SMB2_ENC_KEY_SIZE_MAX];
         uint8_t salt[SMB2_SALT_SIZE];
         uint16_t cypher;
+        /* OpenSSL contexts keyed with the keys above, see smb2_crypto_reset() */
+        void *sign_ctx;
+        void *seal_ctx;
+        void *unseal_ctx;
         uint8_t preauthhash[SMB2_PREAUTH_HASH_SIZE];
         /* on the list smb2_active_contexts() returns: a server's context */
         int on_active_list;
@@ -463,6 +488,10 @@ void smb2_close_connecting_fds(struct smb2_context *smb2);
 #endif
 struct iovec;
 int smb2_quic_handshake_start(struct smb2_context *smb2);
+int smb2_quic_server_handshake_start(struct smb2_context *smb2,
+                                     const char *cert_file,
+                                     const char *key_file);
+int smb2_quic_listen(uint16_t port, int max_connections, int *out_fd);
 int smb2_quic_handshake_service(struct smb2_context *smb2);
 int smb2_quic_events(struct smb2_context *smb2);
 ssize_t smb2_quic_writev(struct smb2_context *smb2,
@@ -487,6 +516,41 @@ void smb2_rdma_cap_io_sizes(struct smb2_context *smb2);
 void smb2_rdma_reset(struct smb2_context *smb2);
 #else
 #define smb2_rdma_reset(smb2) do { } while (0)
+#endif
+
+#ifdef HAVE_SMB2_IOCP
+struct iovec;
+struct addrinfo;
+/* smb2_iocp_service() results besides 0 and -1 */
+#define SMB2_IOCP_CONNECTED      1
+#define SMB2_IOCP_CONNECT_FAILED 2
+/* Addresses connected to in parallel: smb2_connect_async() interleaves
+ * the address families, so normally one IPv6 and one IPv4 address. Unlike
+ * the Happy Eyeballs of the poll interface this needs no caller-driven
+ * timer, and a refused connect takes seconds on windows. */
+#define SMB2_IOCP_PARALLEL_CONNECTS 2
+int smb2_iocp_connect(struct smb2_context *smb2, const struct addrinfo *ai,
+                      t_socket *fd_out);
+int smb2_iocp_service(struct smb2_context *smb2, t_socket *fd, int *err);
+int smb2_iocp_flush(struct smb2_context *smb2);
+int smb2_iocp_broken(struct smb2_context *smb2);
+ssize_t smb2_iocp_writev(struct smb2_context *smb2,
+                         const struct iovec *iov, int iovcnt);
+ssize_t smb2_iocp_readv(struct smb2_context *smb2,
+                        const struct iovec *iov, int iovcnt);
+void smb2_iocp_close(struct smb2_context *smb2, t_socket fd);
+/* Close a socket of the context: an IOCP socket must not be closed
+ * directly, its overlapped operations still in flight outlive it. */
+#define smb2_close_socket(smb2, fd)                                     \
+        do {                                                            \
+                if ((smb2)->iocp_port != NULL) {                        \
+                        smb2_iocp_close((smb2), (fd));                  \
+                } else {                                                \
+                        close(fd);                                      \
+                }                                                       \
+        } while (0)
+#else
+#define smb2_close_socket(smb2, fd) close(fd)
 #endif
 
 void *smb2_alloc_init(struct smb2_context *smb2, size_t size);
@@ -529,6 +593,11 @@ int smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                        struct smb2_header *hdr);
 int smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
                         struct smb2_iovec *iov, size_t niov);
+/*
+ * Frees the OpenSSL contexts keyed with the signing and sealing keys.
+ * Has to be called whenever those keys change, they are rebuilt on use.
+ */
+void smb2_crypto_reset(struct smb2_context *smb2);
 
 int smb2_set_uint8(struct smb2_iovec *iov, int offset, uint8_t value);
 int smb2_set_uint16(struct smb2_iovec *iov, int offset, uint16_t value);
@@ -809,6 +878,7 @@ int smb2_decode_reparse_data_buffer(struct smb2_context *smb2,
 int smb2_read_from_buf(struct smb2_context *smb2);
 void smb2_change_events(struct smb2_context *smb2, t_socket fd, int events);
 void smb2_timeout_pdus(struct smb2_context *smb2);
+void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status);
 
 struct connect_data;                                           /* defined in libsmb2.c */
 void free_c_data(struct smb2_context*, struct connect_data*);  /* defined in libsmb2.c */

@@ -34,6 +34,7 @@ libsmb2_la_SOURCES = \
 	pdu.c \
 	quic.c \
 	smbdirect.c \
+	smbiocp.c \
 	sha.h \
 	sha-private.h \
 	sha1.c \
@@ -70,6 +71,8 @@ libsmb2_la_SOURCES = \
 	smb2-signing.c \
 	socket.c \
 	spnego-wrapper.c \
+	sspi-wrapper.h \
+	sspi-wrapper.c \
 	sync.c \
 	timestamps.c \
 	unicode.c \
@@ -82,7 +85,7 @@ SOAGE=0
 libsmb2_la_LDFLAGS = \
 	-version-info $(SOCURRENT):$(SOREVISION):$(SOAGE) -bindir $(bindir) \
 	-no-undefined -export-symbols $(srcdir)/libsmb2.syms $(MAYBE_LIBKRB5) \
-	$(MAYBE_LIBQUIC) $(MAYBE_LIBRDMACM)
+	$(MAYBE_LIBQUIC) $(MAYBE_LIBRDMACM) $(MAYBE_LIBCRYPTO)
 libsmb2_la_DEPENDENCIES = $(srcdir)/libsmb2.syms
 
 dist_noinst_DATA = libsmb2.syms
