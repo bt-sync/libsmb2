@@ -145,6 +145,11 @@ smb2_parse_args(struct smb2_context *smb2, char *args)
                         } else if(!strcmp(value, "krb5cc")) {
                                 smb2->sec = SMB2_SEC_KRB5;
                                 smb2->use_cached_creds = 1;
+                        } else if(!strcmp(value, "iakerb")) {
+                                /* Password is required: the AS-REQ is built
+                                 * locally and the server proxies it. */
+                                smb2->sec = SMB2_SEC_IAKERB;
+                                smb2->use_cached_creds = 1;
                         } else if (!strcmp(value, "ntlmssp")) {
                                 smb2->sec = SMB2_SEC_NTLMSSP;
                         } else {
@@ -453,26 +458,14 @@ void smb2_add_active_context(struct smb2_context *smb2)
         smb2->on_active_list = 1;
 }
 
-void smb2_destroy_context(struct smb2_context *smb2)
+/*
+ * Complete every PDU of the context with status, as if the server had
+ * answered them all with it. For a context whose connection is gone.
+ */
+void smb2_fail_pdus(struct smb2_context *smb2, uint32_t status)
 {
-        if (smb2 == NULL) {
-                return;
-        }
-
-        smb2_close_connecting_fds(smb2);
-
-        if (SMB2_VALID_SOCKET(smb2->fd)) {
-                if (smb2->change_fd) {
-                        smb2->change_fd(smb2, smb2->fd, SMB2_DEL_FD);
-                }
-                close(smb2->fd);
-                smb2->fd = SMB2_INVALID_SOCKET;
-        }
-        smb2_quic_reset(smb2);
-        smb2_rdma_reset(smb2);
-
         /*
-         * Complete every PDU that is still queued with SMB2_STATUS_SHUTDOWN.
+         * Complete every PDU that is still queued with status.
          * A callback may queue another PDU (e.g. close a file when its read
          * fails), so repeat until all the queues are empty.
          */
@@ -490,57 +483,88 @@ void smb2_destroy_context(struct smb2_context *smb2)
                          */
                         for (p = pdu; p; p = p->next_compound) {
                                 if (p->cb) {
-                                        p->cb(smb2, SMB2_STATUS_SHUTDOWN,
+                                        p->cb(smb2, status,
                                               NULL, p->cb_data);
                                 }
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
                 if (smb2->pdu) {
                         struct smb2_pdu *pdu = smb2->pdu;
 
                         smb2->pdu = NULL;
                         if (pdu->cb) {
-                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
+                                pdu->cb(smb2, status, NULL,
                                         pdu->cb_data);
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
                 if (smb2->next_pdu) {
                         struct smb2_pdu *pdu = smb2->next_pdu;
 
                         smb2->next_pdu = NULL;
                         if (pdu->cb) {
-                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
+                                pdu->cb(smb2, status, NULL,
                                         pdu->cb_data);
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
                 while (smb2->waitqueue) {
                         struct smb2_pdu *pdu = smb2->waitqueue;
 
                         smb2->waitqueue = pdu->next;
                         if (pdu->cb) {
-                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
+                                pdu->cb(smb2, status, NULL,
                                         pdu->cb_data);
                         }
                         if (pdu == smb2->pdu) {
                                 smb2->pdu = NULL;
                         }
-                        smb2_free_pdu(smb2, pdu);
+                        if (!pdu->caller_frees_pdu) {
+                                smb2_free_pdu(smb2, pdu);
+                        }
                 }
         }
         smb2_free_iovector(smb2, &smb2->in);
+}
+
+void smb2_destroy_context(struct smb2_context *smb2)
+{
+        if (smb2 == NULL) {
+                return;
+        }
+
+        smb2_close_connecting_fds(smb2);
+
+        if (SMB2_VALID_SOCKET(smb2->fd)) {
+                if (smb2->change_fd) {
+                        smb2->change_fd(smb2, smb2->fd, SMB2_DEL_FD);
+                }
+                smb2_close_socket(smb2, smb2->fd);
+                smb2->fd = SMB2_INVALID_SOCKET;
+        }
+        smb2_quic_reset(smb2);
+        smb2_rdma_reset(smb2);
+
+        smb2_fail_pdus(smb2, SMB2_STATUS_SHUTDOWN);
 
         if (smb2->connect_cb) {
            smb2->connect_cb(smb2, SMB2_STATUS_CANCELLED,
                          NULL, smb2->connect_data);
            smb2->connect_cb = NULL;
         }
+        smb2_crypto_reset(smb2);
         free(smb2->session_key);
         smb2->session_key = NULL;
 
         free(discard_const(smb2->user));
+        free(smb2->local_user);
         free(discard_const(smb2->server));
         free(discard_const(smb2->share));
         free(discard_const(smb2->password));
@@ -917,6 +941,14 @@ const char *smb2_get_user(struct smb2_context *smb2)
         return NULL;
 }
 
+const char *smb2_get_local_user(struct smb2_context *smb2)
+{
+        if (smb2 && smb2->local_user) {
+                return smb2->local_user;
+        }
+        return NULL;
+}
+
 const char *smb2_get_workstation(struct smb2_context *smb2)
 {
         if (smb2 && smb2->workstation) {
@@ -994,6 +1026,10 @@ void smb2_set_sign(struct smb2_context *smb2, int val)
 void smb2_set_authentication(struct smb2_context *smb2, int val)
 {
         smb2->sec = (enum smb2_sec)val;
+        if (smb2->sec == SMB2_SEC_IAKERB) {
+                /* Same password path as sec=iakerb in the URL. */
+                smb2->use_cached_creds = 1;
+        }
 }
 
 void smb2_set_timeout(struct smb2_context *smb2, int seconds)

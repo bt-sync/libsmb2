@@ -149,7 +149,7 @@ smb2_close_connecting_fds(struct smb2_context *smb2)
                 if (smb2->change_fd) {
                         smb2->change_fd(smb2, fd, SMB2_DEL_FD);
                 }
-                close(fd);
+                smb2_close_socket(smb2, fd);
         }
         free(smb2->connecting_fds);
         smb2->connecting_fds = NULL;
@@ -241,6 +241,39 @@ smb2_get_fds(struct smb2_context *smb2, size_t *fd_count, int *timeout)
         }
 }
 
+/* A QUIC socket reports the peer closing as ENOTCONN or EPIPE where TCP
+ * returns 0 from a read. */
+static int
+smb2_peer_closed(int err)
+{
+#ifdef EPIPE
+        if (err == EPIPE) {
+                return 1;
+        }
+#endif
+#ifdef ENOTCONN
+        if (err == ENOTCONN) {
+                return 1;
+        }
+#endif
+#ifdef ECONNRESET
+        if (err == ECONNRESET) {
+                return 1;
+        }
+#endif
+#ifdef WSAENOTCONN
+        if (err == WSAENOTCONN) {
+                return 1;
+        }
+#endif
+#ifdef WSAECONNRESET
+        if (err == WSAECONNRESET) {
+                return 1;
+        }
+#endif
+        return 0;
+}
+
 int
 smb2_write_to_socket(struct smb2_context *smb2)
 {
@@ -319,15 +352,24 @@ smb2_write_to_socket(struct smb2_context *smb2)
                         count = smb2_rdma_writev(smb2, tmpiov, niov);
                 } else
 #endif
+#ifdef HAVE_SMB2_IOCP
+                if (smb2->iocp_port != NULL) {
+                        count = smb2_iocp_writev(smb2, tmpiov, niov);
+                } else
+#endif
                 count = writev(smb2->fd, tmpiov, niov);
 
                 if (count == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                                 return 0;
                         }
+                        if (smb2_peer_closed(errno)) {
+                                smb2_set_error(smb2, "Write to socket failed, "
+                                               "remote closed connection.");
+                                return -1;
+                        }
                         smb2_set_error(smb2, "Error when writing to "
-                                       "socket :%d %s", errno,
-                                       smb2_get_error(smb2));
+                                       "socket :%d", errno);
                         return -1;
                 }
 
@@ -418,6 +460,9 @@ smb2_pdu_bytes_left(struct smb2_context *smb2)
 typedef ssize_t (*read_func)(struct smb2_context *smb2,
                              const struct iovec *iov, int iovcnt);
 
+/* SMB1 header, WordCount and ByteCount */
+#define SMB1_NEGOTIATE_MIN_SIZE 35
+
 static int smb2_read_data(struct smb2_context *smb2, read_func func,
                           int has_xfrmhdr)
 {
@@ -427,8 +472,10 @@ static int smb2_read_data(struct smb2_context *smb2, read_func func,
         size_t num_done;
         size_t iov_offset = 0;
         static char smb3tfrm[4] = {0xFD, 'S', 'M', 'B'};
+        static char smb1_magic[4] = {0xFF, 'S', 'M', 'B'};
         struct smb2_pdu *pdu = smb2->pdu;
         ssize_t count;
+        uint32_t hdr_len;
         int len;
 
 read_more_data:
@@ -485,6 +532,11 @@ read_more_data:
 #endif
                         return -EAGAIN;
                 }
+                if (smb2_peer_closed(err)) {
+                        smb2_set_error(smb2, "Read from socket failed, "
+                                       "remote closed connection.");
+                        return -1;
+                }
                 smb2_set_error(smb2, "Read from socket failed, "
                                "errno:%d. Closing socket.", err);
                 return -1;
@@ -512,7 +564,17 @@ read_more_data:
                  * bare SMB2 header, or that is large enough to be a memory
                  * exhaustion vector, before we act on it.
                  */
-                if (smb2->spl < SMB2_HEADER_SIZE ||
+                /*
+                 * A server must also take an SMB1 NEGOTIATE, which can be
+                 * shorter than an SMB2 header: a Windows client offering
+                 * only SMB2 dialects sends 58 bytes.
+                 */
+                hdr_len = SMB2_HEADER_SIZE;
+                if (smb2_is_server(smb2) && smb2->spl >= SMB1_NEGOTIATE_MIN_SIZE &&
+                    smb2->spl < SMB2_HEADER_SIZE) {
+                        hdr_len = smb2->spl;
+                }
+                if (smb2->spl < hdr_len ||
                     smb2->spl > smb2_recv_pdu_cap(smb2)) {
                         smb2_set_error(smb2, "Invalid session packet length "
                                        "%u in PDU", smb2->spl);
@@ -520,12 +582,18 @@ read_more_data:
                 }
                 smb2->recv_state = SMB2_RECV_HEADER;
                 if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
-                                  SMB2_HEADER_SIZE, NULL) == NULL) {
+                                  hdr_len, NULL) == NULL) {
                         smb2_set_error(smb2, "Too many I/O vectors when adding header");
                         return -1;
                 }
                 goto read_more_data;
         case SMB2_RECV_HEADER:
+                if (smb2->in.iov[smb2->in.niov - 1].len < SMB2_HEADER_SIZE &&
+                    memcmp(smb2->in.iov[smb2->in.niov - 1].buf, smb1_magic, 4)) {
+                        smb2_set_error(smb2, "Invalid session packet length "
+                                       "%u in PDU", smb2->spl);
+                        return -1;
+                }
                 if (!memcmp(smb2->in.iov[smb2->in.niov - 1].buf, smb3tfrm, 4)) {
                         {
                                 /* validate the transform header before allocating for its payload */
@@ -607,6 +675,10 @@ read_more_data:
                                        "encrypted session");
                         return -1;
                 }
+                /* a server encrypts its responses once the client encrypts */
+                if (smb2_is_server(smb2) && smb2->enc != NULL) {
+                        smb2->seal = 1;
+                }
                 if (smb2_decode_header(smb2, &smb2->in.iov[smb2->in.niov - 1],
                                        &smb2->hdr) != 0) {
                         smb2_set_error(smb2, "Failed to decode smb2 "
@@ -619,7 +691,8 @@ read_more_data:
                         uint8_t flusher[32];
                         struct iovec fiov;
 
-                        if (smb2->in.num_done != SMB2_SPL_SIZE + SMB2_HEADER_SIZE) {
+                        if (smb2->in.num_done != SMB2_SPL_SIZE +
+                            smb2->in.iov[smb2->in.niov - 1].len) {
                                 smb2_set_error(smb2, "SMB1 NEGOTIATE inside a "
                                                "compound");
                                 return -1;
@@ -1160,6 +1233,11 @@ static ssize_t smb2_readv_from_socket(struct smb2_context *smb2,
                 return smb2_rdma_readv(smb2, iov, iovcnt);
         }
 #endif
+#ifdef HAVE_SMB2_IOCP
+        if (smb2->iocp_port != NULL) {
+                return smb2_iocp_readv(smb2, iov, iovcnt);
+        }
+#endif
         rc = readv(smb2->fd, (struct iovec*) iov, iovcnt);
         return rc;
 }
@@ -1233,7 +1311,7 @@ smb2_close_connecting_fd(struct smb2_context *smb2, t_socket fd)
 {
         size_t i;
 
-        close(fd);
+        smb2_close_socket(smb2, fd);
         /* Remove the fd from the connecting_fds array */
         for (i = 0; i < smb2->connecting_fds_count; ++i) {
                 if (fd == smb2->connecting_fds[i]) {
@@ -1251,6 +1329,79 @@ int
 smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
 {
         int ret = 0;
+
+#ifdef HAVE_SMB2_IOCP
+        /* Called after every completion (and as a timer, for timeouts):
+         * there are no readiness events, so fd and revents do not matter. */
+        if (smb2->iocp_port != NULL) {
+                t_socket cfd = SMB2_INVALID_SOCKET;
+                int err = 0;
+
+                ret = smb2_iocp_service(smb2, &cfd, &err);
+                if (ret == SMB2_IOCP_CONNECT_FAILED) {
+                        smb2_close_connecting_fd(smb2, cfd);
+                        if (smb2->next_addrinfo != NULL) {
+                                smb2_connect_async_next_addr(smb2, smb2->next_addrinfo);
+                        }
+                        if (smb2->connecting_fds_count > 0) {
+                                /* other addresses are still being tried */
+                                ret = 0;
+                                goto iocp_out;
+                        }
+                        ret = -1;
+                        smb2_set_error(smb2, "smb2_service: socket error "
+                                        "%s(%d) while connecting.",
+                                        strerror(err), err);
+                        if (smb2->connect_cb) {
+                                smb2->connect_cb(smb2, err, NULL, smb2->connect_data);
+                                smb2->connect_cb = NULL;
+                        }
+                        goto iocp_out;
+                }
+                if (ret == SMB2_IOCP_CONNECTED) {
+                        ret = 0;
+                        smb2->fd = cfd;
+                        smb2_close_connecting_fds(smb2);
+                        if (smb2->connect_cb) {
+                                smb2->connect_cb(smb2, 0, NULL, smb2->connect_data);
+                                smb2->connect_cb = NULL;
+                        }
+                }
+                if (ret < 0 || !SMB2_VALID_SOCKET(smb2->fd)) {
+                        goto iocp_out;
+                }
+                if (smb2_read_from_socket(smb2) != 0) {
+                        /* A callback closing the connection (disconnect,
+                         * or a failed connect, both already reported to
+                         * the caller through their callbacks) is not a
+                         * failure of this call. A read error leaves the
+                         * socket open. */
+                        ret = SMB2_VALID_SOCKET(smb2->fd) ? -1 : 0;
+                        goto iocp_out;
+                }
+                if (!SMB2_VALID_SOCKET(smb2->fd)) {
+                        goto iocp_out;
+                }
+                if (smb2->outqueue != NULL &&
+                    smb2_write_to_socket(smb2) != 0) {
+                        ret = -1;
+                        goto iocp_out;
+                }
+                if (smb2_iocp_flush(smb2) < 0) {
+                        ret = -1;
+                }
+  iocp_out:
+                /* No reply can come on a broken connection: fail what is
+                 * queued and waiting now, once the replies that did arrive
+                 * have been processed above. */
+                if (smb2_iocp_broken(smb2)) {
+                        smb2_fail_pdus(smb2,
+                                       SMB2_STATUS_CONNECTION_DISCONNECTED);
+                        ret = -1;
+                }
+                goto out;
+        }
+#endif
 
         if (!SMB2_VALID_SOCKET(fd)) {
                 /* Connect to a new addr in parallel */
@@ -1383,13 +1534,13 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
                         smb2->connect_cb = NULL;
                 }
                 ret = -1;
-                goto out;
+                goto disconnected;
         }
         if (revents & POLLHUP) {
                 smb2_set_error(smb2, "smb2_service: POLLHUP, "
                                 "socket error.");
                 ret = -1;
-                goto out;
+                goto disconnected;
         }
 
         if (!SMB2_VALID_SOCKET(smb2->fd) && revents & POLLOUT) {
@@ -1438,17 +1589,22 @@ smb2_service_fd(struct smb2_context *smb2, t_socket fd, int revents)
         if (revents & POLLIN) {
                 if (smb2_read_from_socket(smb2) != 0) {
                         ret = -1;
-                        goto out;
+                        goto disconnected;
                 }
         }
 
         if (revents & POLLOUT && smb2->outqueue != NULL) {
                 if (smb2_write_to_socket(smb2) != 0) {
                         ret = -1;
-                        goto out;
+                        goto disconnected;
                 }
         }
+        goto out;
 
+  disconnected:
+        if (fd == smb2->fd && !smb2_is_server(smb2)) {
+                smb2_fail_pdus(smb2, SMB2_STATUS_CONNECTION_DISCONNECTED);
+        }
   out:
         if (smb2->timeout) {
                 smb2_timeout_pdus(smb2);
@@ -1638,6 +1794,25 @@ smb2_connect_async_next_addr(struct smb2_context *smb2, const struct addrinfo *b
                                 smb2_set_error(smb2, "");
                                 smb2_close_connecting_fds(smb2);
                                 return 0;
+                        }
+                        continue;
+                }
+#endif
+#ifdef HAVE_SMB2_IOCP
+                if (smb2->iocp_port != NULL) {
+                        t_socket s;
+
+                        /* A few addresses in parallel, the first to
+                         * connect wins. The rest are tried as these
+                         * fail, see smb2_service_fd(). */
+                        if (smb2->connecting_fds_count >= SMB2_IOCP_PARALLEL_CONNECTS) {
+                                break;
+                        }
+                        smb2->next_addrinfo = ai->ai_next;
+                        if (smb2_iocp_connect(smb2, ai, &s) == 0) {
+                                smb2_set_error(smb2, "");
+                                smb2->connecting_fds[smb2->connecting_fds_count++] = s;
+                                err = 0;
                         }
                         continue;
                 }

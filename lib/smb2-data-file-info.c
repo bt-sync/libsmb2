@@ -125,6 +125,12 @@ smb2_encode_file_attribute_tag_info(struct smb2_context *smb2 _U_,
         return 8;
 }
 
+static uint64_t
+smb2_basic_info_time(struct smb2_timeval *tv, uint64_t raw)
+{
+        return raw ? raw : smb2_tv_timeval_to_win(tv);
+}
+
 int
 smb2_encode_file_basic_info(struct smb2_context *smb2,
                             struct smb2_file_basic_info *fs,
@@ -132,16 +138,16 @@ smb2_encode_file_basic_info(struct smb2_context *smb2,
 {
         uint64_t t;
 
-        t = smb2_tv_timeval_to_win(&fs->creation_time);
+        t = smb2_basic_info_time(&fs->creation_time, fs->creation_time_raw);
         smb2_set_uint64(vec, 0, t);
 
-        t = smb2_tv_timeval_to_win(&fs->last_access_time);
+        t = smb2_basic_info_time(&fs->last_access_time, fs->last_access_time_raw);
         smb2_set_uint64(vec, 8, t);
 
-        t = smb2_tv_timeval_to_win(&fs->last_write_time);
+        t = smb2_basic_info_time(&fs->last_write_time, fs->last_write_time_raw);
         smb2_set_uint64(vec, 16, t);
 
-        t = smb2_tv_timeval_to_win(&fs->change_time);
+        t = smb2_basic_info_time(&fs->change_time, fs->change_time_raw);
         smb2_set_uint64(vec, 24, t);
 
         smb2_set_uint32(vec, 32, fs->file_attributes);

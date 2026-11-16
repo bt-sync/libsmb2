@@ -240,6 +240,7 @@ SMB2_AESNI static void smb2_aesni_cmac(const uint8_t key[16], const uint8_t *msg
         _mm_storeu_si128((__m128i *)(void *)mac, x);
 }
 
+#ifndef HAVE_OPENSSL
 /* Copies want bytes of the message from iovec *v at offset *at onwards, crossing into the next iovecs. */
 static void smb2_iov_gather(const struct smb2_iovec *iov, size_t niov, size_t *v, size_t *at, uint8_t *out,
                             size_t want)
@@ -311,6 +312,7 @@ SMB2_AESNI static void smb2_aesni_cmac_iov(const uint8_t key[16], const struct s
         x = smb2_aesni_encrypt(_mm_xor_si128(x, _mm_loadu_si128((const __m128i *)(const void *)last)), rk);
         _mm_storeu_si128((__m128i *)(void *)mac, x);
 }
+#endif /* !HAVE_OPENSSL */
 #endif
 
 void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
@@ -362,6 +364,88 @@ void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
         memcpy(mac, scratch, AES128_KEY_LEN);
 }
 
+#ifdef HAVE_OPENSSL
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+
+/*
+ * The MAC context is created once per signing key and reinitialised for
+ * every PDU: fetching the algorithm and allocating the context each time
+ * costs more than the MAC itself on a small PDU.
+ */
+static EVP_MAC_CTX *smb2_sign_ctx(struct smb2_context *smb2)
+{
+        EVP_MAC *m;
+        EVP_MAC_CTX *ctx;
+        OSSL_PARAM params[2];
+        int cmac = smb2->dialect > SMB2_VERSION_0210;
+
+        if (smb2->sign_ctx != NULL) {
+                return smb2->sign_ctx;
+        }
+        m = EVP_MAC_fetch(NULL, cmac ? OSSL_MAC_NAME_CMAC : OSSL_MAC_NAME_HMAC, NULL);
+        if (m == NULL) {
+                return NULL;
+        }
+        ctx = EVP_MAC_CTX_new(m);
+        EVP_MAC_free(m);
+        if (ctx == NULL) {
+                return NULL;
+        }
+        params[0] = cmac ?
+                OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, "AES-128-CBC", 0) :
+                OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0);
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_MAC_init(ctx, smb2->signing_key, SMB2_KEY_SIZE, params) != 1) {
+                EVP_MAC_CTX_free(ctx);
+                return NULL;
+        }
+        smb2->sign_ctx = ctx;
+        return ctx;
+}
+
+static int smb2_openssl_mac(struct smb2_context *smb2, const struct smb2_iovec *iov,
+                            size_t niov, uint8_t mac[32])
+{
+        EVP_MAC_CTX *ctx;
+        size_t i, len;
+
+        ctx = smb2_sign_ctx(smb2);
+        if (ctx == NULL) {
+                return -1;
+        }
+        /* restarting with a NULL key gives wrong CMACs (OpenSSL 3.5) */
+        if (EVP_MAC_init(ctx, smb2->signing_key, SMB2_KEY_SIZE, NULL) != 1) {
+                goto err;
+        }
+        for (i = 0; i < niov; i++) {
+                if (iov[i].len && EVP_MAC_update(ctx, iov[i].buf, iov[i].len) != 1) {
+                        goto err;
+                }
+        }
+        if (EVP_MAC_final(ctx, mac, &len, 32) != 1) {
+                goto err;
+        }
+        return 0;
+ err:
+        EVP_MAC_CTX_free(ctx);
+        smb2->sign_ctx = NULL;
+        return -1;
+}
+#endif
+
+void smb2_crypto_reset(struct smb2_context *smb2)
+{
+#ifdef HAVE_OPENSSL
+        EVP_MAC_CTX_free(smb2->sign_ctx);
+        EVP_CIPHER_CTX_free(smb2->seal_ctx);
+        EVP_CIPHER_CTX_free(smb2->unseal_ctx);
+#endif
+        smb2->sign_ctx = NULL;
+        smb2->seal_ctx = NULL;
+        smb2->unseal_ctx = NULL;
+}
+
 int
 smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
                     struct smb2_iovec *iov, size_t niov)
@@ -370,6 +454,18 @@ smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
         /* Clear the smb2 header signature field field */
         memset(iov[0].buf + 48, 0, 16);
 
+#ifdef HAVE_OPENSSL
+        {
+                uint8_t mac[32];
+
+                if (smb2_openssl_mac(smb2, iov, niov, mac)) {
+                        smb2_set_error(smb2, "Failed to calculate the signature");
+                        return -1;
+                }
+                memcpy(&signature[0], mac, SMB2_SIGNATURE_SIZE);
+                return 0;
+        }
+#else
         if (smb2->dialect > SMB2_VERSION_0210) {
                 size_t i = 0;
                 size_t len = 0, offset = 0;
@@ -415,6 +511,7 @@ smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
         }
 
         return 0;
+#endif
 }
 
 int

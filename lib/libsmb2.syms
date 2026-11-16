@@ -95,6 +95,7 @@ smb2_get_file_id
 smb2_get_last_request_async_id
 smb2_get_last_request_message_id
 smb2_get_last_reply_message_id
+smb2_get_local_user
 smb2_get_last_request_tree_id
 smb2_get_max_read_size
 smb2_get_max_write_size
@@ -110,6 +111,8 @@ smb2_get_uint32
 smb2_get_user
 smb2_get_workstation
 smb2_init_context
+smb2_iocp_attach
+smb2_iocp_complete
 smb2_link
 smb2_link_async
 smb2_lseek
@@ -167,6 +170,7 @@ smb2_set_pdu_status
 smb2_set_seal
 smb2_set_security_mode
 smb2_set_sign
+smb2_set_sspi_cred
 smb2_set_timeout
 smb2_set_tree_id_for_pdu
 smb2_get_user
